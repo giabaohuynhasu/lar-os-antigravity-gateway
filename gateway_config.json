@@ -1,0 +1,33 @@
+{
+  "gateway": {
+    "name": "LAR-OS Unified AI Gateway",
+    "version": "1.0.0",
+    "host": "127.0.0.1",
+    "port": 18797,
+    "auth_token": "lar-os-master"
+  },
+  "providers": {
+    "gemini": {
+      "default_model": "gemini-2.5-flash",
+      "api_key_env": "GEMINI_API_KEY"
+    },
+    "quad_browser_cdp": {
+      "enabled": true,
+      "ports": {
+        "comet_perplexity": 9222,
+        "edge_copilot": 9223,
+        "chrome_gemini": 9224,
+        "opera_neon_chatgpt": 9225
+      }
+    },
+    "openrouter": {
+      "api_key_env": "OPENROUTER_API_KEY",
+      "base_url": "https://openrouter.ai/api/v1"
+    },
+    "nvidia_nim": {
+      "api_key_env": "NVIDIA_NIM_API_KEY",
+      "base_url": "https://integrate.api.nvidia.com/v1"
+    }
+  },
+  "default_route": "gemini-2.5-flash"
+}
