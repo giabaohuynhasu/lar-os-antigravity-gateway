@@ -1,111 +1,104 @@
-# ⚡ LAR-OS Unified AI Gateway: Antigravity-First Dual-Protocol Proxy
+---
+license: mit
+tags:
+- lar-os
+- ai-gateway
+- antigravity
+- cloud-cluster
+- notebooklm
+---
+
+# LAR-OS Antigravity Gateway (v2.0)
+**High-Throughput Multi-Account Round-Robin AI Gateway, Cloud Shell Cluster & JIT NotebookLM Authenticator**
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
-[![Python 3.10+](https://img.shields.io/badge/python-3.10+-blue.svg)](https://www.python.org/downloads/)
-[![FastAPI](https://img.shields.io/badge/FastAPI-0.100+-green.svg)](https://fastapi.tiangolo.com)
-[![Status: Production Ready](https://img.shields.io/badge/Status-Production%20Ready-success.svg)]()
-
-> **Non-destructive, dual-protocol AI model proxy designed for Google Antigravity IDE, Tencent WorkBuddy AI, and Claude Code CLI.**  
-> Built by **Gia Bao Huynh (Jun)** under the **LAR-OS High-Throughput Multi-Agent Swarm Architecture**.
+[![Python 3.10+](https://img.shields.io/badge/Python-3.10%2B-blue.svg)](https://www.python.org/downloads/)
+[![Hugging Face](https://img.shields.io/badge/%F0%9F%A4%97%20Hugging%20Face-lar--os--antigravity--gateway-blue)](https://hf.co/Jun33550336/lar-os-antigravity-gateway)
 
 ---
 
 ## 🌟 Executive Overview
+**LAR-OS Antigravity Gateway** is an enterprise-grade AI orchestration gateway designed to unify distributed compute, multi-account quota balancing, edge device zero-disk execution, and session-persistent research tooling.
 
-While existing community solutions rely on reverse-engineering and patching Google Antigravity's internal Electron binaries (which break upon every auto-update) or target only Claude Code CLI, **LAR-OS Unified AI Gateway** introduces an architectural synthesis:
-
-1. **Non-Destructive Skeleton:** Runs as an external, high-performance async proxy server (`FastAPI / Uvicorn`) on localhost port `18797`. Zero binary patching, zero system crashes, 100% update-immune.
-2. **Dual-Protocol Endpoints:**
-   - **OpenAI Compatible (`/v1/chat/completions`, `/v1/models`):** Natively plugs into Antigravity IDE's official "Add Model" setting and Tencent WorkBuddy AI.
-   - **Anthropic Compatible (`/v1/messages`):** Seamlessly routes traffic from Anthropic's `claude-code` CLI.
-3. **Multi-Tier Hybrid Backends:**
-   - **Tier 1:** Local **Google Gemini** integration (via `google-genai` SDK or Chrome CDP port 9224 with 1M-2M context).
-   - **Tier 2:** **Zero-Quota Quad-Browser AI Consortium** (`Comet:9222`, `Edge:9223`, `Chrome:9224`, `Opera Neon:9225`) executing multi-engine parallel consensus across Perplexity, Copilot, Gemini, and ChatGPT.
-   - **Tier 3:** Free Cloud AI Tiers (NVIDIA NIM 1,000 RPD, OpenRouter Free, Groq).
+It serves as the runtime backbone for **LAR-OS (Longevity & Asymmetry Research Operating System)**, preventing system bottlenecks, memory leaks, context overflow, and API rate limits.
 
 ---
 
-## 🏛️ System Architecture
+## ⚡ Key Architectural Capabilities
 
-```
-                      Gia Bao Huynh (Jun) / LAR-OS
-                                   │
-         ┌─────────────────────────┴─────────────────────────┐
-         ▼                                                   ▼
-  [Antigravity IDE & WorkBuddy]                       [Claude Code CLI]
-    (OpenAI /v1/chat/completions)                      (Anthropic /v1/messages)
-         │                                                   │
-         └─────────────────────────┬─────────────────────────┘
-                                   │ Port 18797
-                                   ▼
-         ┌───────────────────────────────────────────────────┐
-         │          ⚡ LAR-OS UNIFIED AI GATEWAY             │
-         │   (Async FastAPI • Protocol Translator • Cache)   │
-         └─────────────────────────┬─────────────────────────┘
-                                   │
-         ┌─────────────────────────┼─────────────────────────┐
-         ▼                         ▼                         ▼
-  [Google Gemini API]    [Quad-Browser Consortium]     [Cloud Free Tiers]
- • 1.500 RPD Free Tier    • Comet (Perplexity: 9222)   • NVIDIA NIM (1.000 RPD)
- • 1M-2M Context Window   • Edge (Copilot 4o: 9223)    • OpenRouter Free Tiers
- • Zero-Token CDP Bridge  • Chrome (Gemini: 9224)      • Groq Cloud Llama 3.3
-                          • Opera Neon (ChatGPT: 9225)
-```
+### 1. True Round-Robin Multi-Account Load Balancer (`port 18797`)
+- Provides an **OpenAI-compatible `/v1/chat/completions` API**.
+- Dynamically cycles sequential requests across multiple Google Pro API accounts (`thuaquan228`, `baohuynhgia0512`, `giabaohuynh0512`, `giabaohuynh.researcher`).
+- Features non-blocking asynchronous execution (`asyncio.to_thread`) targeting `gemini-3.5-flash-lite` with automatic HTTP 429 rate-limit backoff and failover.
+
+### 2. Multi-Node Google Cloud Shell Cluster (`cloud_shell_bridge.py`)
+- Solves edge hardware storage constraints (such as low-storage Chromebooks or thin clients) by routing heavy workloads to **Google Cloud Shell Linux worker nodes**.
+- Zero local disk space consumed on edge hardware (**0 MB local storage footprint**).
+- Leverages Google Cloud secure SSH tunneling to run multi-node jobs across:
+  - **Node 1**: 4 vCPUs (Intel Xeon @ 2.20GHz), 16 GB RAM (Debian Linux x86_64).
+  - **Node 2**: 4 vCPUs (Intel Xeon @ 2.20GHz), 8 GB RAM (Debian Linux x86_64).
+- Totaling **24 GB RAM combined cloud compute** at zero infrastructure cost.
+
+### 3. Just-In-Time (JIT) NotebookLM Auto-Authentication (`nlm_safe.py`)
+- Eliminates the recurring expiration of Google session cookies (`__Secure-1PSIDTS`).
+- **Zero Heartbeat / No Polling**: Operates strictly on-demand. Before executing any notebook query or mutation, verifies credentials via `nlm login --check` in 0.2s.
+- If expired, automatically re-authenticates headlessly using the persistent local Chrome profile without requiring user intervention or persistent background daemons.
+
+### 4. Anti-Crash Protocol (ACP-V1) Guard (`anti_crash_guard.py`)
+- Automated memory and task lifecycle watchdog.
+- Enforces strict limits: max 2 concurrent background tasks, ephemeral sandbox pruning, orphan process termination, and context token slicing ($\le 50$ lines per command output).
+
+---
+
+## 🏛️ Account & Role Matrix
+
+| STT | Account Identifier | Role | Responsibilities |
+|---|---|---|---|
+| 1 | `thuaquan228@gmail.com` | **Lead Architect & Core Engine** | Architectural synthesis, primary code generation, Cloud Shell Node 1 (16GB RAM) |
+| 2 | `baohuynhgia0512@gmail.com` | **Deep Reasoning & Security Logic** | Formal logic verification, quantitative auditing, security review |
+| 3 | `giabaohuynh0512@gmail.com` | **System Automation & Daemon** | Task scheduling, filesystem I/O, watchdog execution, Cloud Shell Node 2 (8GB RAM) |
+| 4 | `giabaohuynh.researcher@gmail.com` | **Knowledge Discovery & Multimodal** | Academic literature retrieval, multimodal artifact ingestion |
 
 ---
 
 ## 🚀 Quickstart
 
-### 1. Installation & Launch
+### 1. Requirements
 ```bash
-git clone https://github.com/giabaohuynhasu/lar-os-antigravity-gateway.git
-cd lar-os-antigravity-gateway
-
-# Run via uv (recommended):
-uv run --with fastapi --with uvicorn python lar_os_gateway.py
+pip install -r requirements.txt
 ```
 
-The gateway immediately listens on:
-- Health Check: `http://127.0.0.1:18797/health`
-- Models List: `http://127.0.0.1:18797/v1/models`
-- OpenAI Chat: `http://127.0.0.1:18797/v1/chat/completions`
-- Anthropic Messages: `http://127.0.0.1:18797/v1/messages`
+### 2. Start the Gateway Daemon
+```bash
+python lar_os_gateway.py
+```
+The gateway will start on `http://127.0.0.1:18797`.
 
----
+### 3. Query the Gateway (OpenAI Compatible)
+```bash
+curl http://127.0.0.1:18797/v1/chat/completions \
+  -H "Content-Type: application/json" \
+  -H "Authorization: Bearer lar-os-master" \
+  -d '{
+    "model": "gemini-3.5-flash-lite",
+    "messages": [{"role": "user", "content": "Ping from LAR-OS Swarm"}]
+  }'
+```
 
-## 🔌 Client Setup
+### 4. Run Multi-Node Cloud Shell Audit
+```bash
+python cloud_shell_bridge.py
+```
 
-### A. Antigravity IDE & Tencent WorkBuddy AI
-Open Settings → **Add Model (OpenAI-compatible)**:
-- **Provider:** `OpenAI-compatible`
-- **Base URL:** `http://127.0.0.1:18797/v1`
-- **API Key:** `lar-os-master`
-- **Model Name:** `gemini-2.5-flash` or `deepseek-r1-quad`
-
-### B. Claude Code CLI
-Point the Anthropic CLI directly to the Gateway:
-```powershell
-$env:ANTHROPIC_BASE_URL="http://127.0.0.1:18797"
-$env:ANTHROPIC_API_KEY="lar-os-master"
-claude
+### 5. Safe NotebookLM Execution
+```bash
+python nlm_safe.py notebook list
 ```
 
 ---
 
-## 🏆 Attribution & Credits
-
-This architectural design synthesizes and builds upon groundbreaking foundational ideas from the open-source community:
-
-1. **[vahapogut](https://github.com/vahapogut)** (Creator of [`antigravity-add-model`](https://github.com/vahapogut/antigravity-add-model)):
-   - *Inspiration:* Pioneered the concept of extending Google Antigravity with external LLM providers and custom model picker interfacing.
-2. **[Alishahryar1](https://github.com/Alishahryar1)** (Creator of [`free-claude-code`](https://github.com/Alishahryar1/free-claude-code)):
-   - *Inspiration:* Pioneered the clean local proxy pattern translating Anthropic Messages API into free backends with streaming and tool usage.
-
-LAR-OS Gateway merges these two paradigms into a non-destructive, enterprise-grade unified architecture.
-
----
-
-## 📄 License
-
-Released under the [MIT License](LICENSE).  
-Copyright (c) 2026 **Gia Bao Huynh (Jun)** & **LAR-OS Research Foundation**.
+## 📄 License & Attribution
+- **Author:** Gia Bao Huynh (Jun)
+- **ORCID:** [0009-0008-2372-5852](https://orcid.org/0009-0008-2372-5852)
+- **Affiliation:** Independent Scholar / Arizona State University
+- **License:** MIT License

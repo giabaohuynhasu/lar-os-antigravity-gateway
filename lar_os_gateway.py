@@ -157,30 +157,61 @@ async def generate_response_text(model: str, messages: List[Dict[str, Any]]) -> 
             res = await query_edge_copilot(prompt)
             return f"[Microsoft Copilot Result]:\n{res}"
 
-    # 5. Default: Google Gemini via google-genai SDK or Chrome CDP
-    gemini_key = os.environ.get("GEMINI_API_KEY") or os.environ.get("GOOGLE_API_KEY")
-    if gemini_key:
+    # 5. Default: Google Gemini via multi-account key pool (or Chrome CDP fallback)
+    keys_pool = []
+    keys_file = SCRATCH / "gateway_keys.json"
+    if keys_file.exists():
         try:
-            from google import genai
-            client = genai.Client(api_key=gemini_key)
-            resp = client.models.generate_content(
-                model="gemini-2.5-flash",
-                contents=prompt
-            )
-            if hasattr(resp, "text") and resp.text:
-                return resp.text
-        except Exception as e:
-            pass
-
-    # Fallback to Chrome Gemini CDP if key not set
-    if query_chrome_gemini:
-        try:
-            res = await query_chrome_gemini(prompt)
-            return res
+            with open(keys_file, "r", encoding="utf-8") as kf:
+                kd = json.load(kf)
+                for item in kd.get("api_keys", []):
+                    k = item.get("key", "").strip()
+                    if k and item.get("status") == "ACTIVE":
+                        keys_pool.append({"key": k, "account": item.get("account", "unknown")})
         except Exception:
             pass
+            
+    # Include env fallback
+    env_k = os.environ.get("GEMINI_API_KEY") or os.environ.get("GOOGLE_API_KEY")
+    if env_k and not any(x["key"] == env_k for x in keys_pool):
+        keys_pool.append({"key": env_k, "account": "ENV_DEFAULT"})
 
-    return f"LAR-OS Unified Gateway response for model '{model}': Received query '{prompt[:60]}...'. All local backends (Gemini, Quad-Browser) are ready."
+    global _round_robin_counter
+    if "_round_robin_counter" not in globals():
+        _round_robin_counter = 0
+
+    if keys_pool:
+        # True Round-Robin Load Balancing across active keys
+        target_model = "gemini-3.5-flash-lite" if ("flash" in model or "2.5" in model) else model
+        n_keys = len(keys_pool)
+        start_idx = _round_robin_counter % n_keys
+        _round_robin_counter += 1
+
+        ordered_pool = keys_pool[start_idx:] + keys_pool[:start_idx]
+        for key_entry in ordered_pool:
+            try:
+                def _do_request(k, m, p):
+                    import urllib.request
+                    import json
+                    u = f"https://generativelanguage.googleapis.com/v1beta/models/{m}:generateContent?key={k}"
+                    d = json.dumps({"contents": [{"parts": [{"text": p}]}], "generationConfig": {"maxOutputTokens": 300}}).encode("utf-8")
+                    req = urllib.request.Request(u, data=d, headers={"Content-Type": "application/json"}, method="POST")
+                    with urllib.request.urlopen(req, timeout=10) as r:
+                        if r.status == 200:
+                            data = json.loads(r.read().decode("utf-8"))
+                            cand = data.get("candidates", [{}])[0]
+                            parts = cand.get("content", {}).get("parts", [])
+                            if parts:
+                                return parts[0].get("text", "")
+                    return None
+
+                res_text = await asyncio.to_thread(_do_request, key_entry["key"], target_model, prompt)
+                if res_text:
+                    print(f"[Gateway Router] Request successfully routed & fulfilled by account: {key_entry['account']} (Model: {target_model})")
+                    return res_text
+            except Exception as e:
+                print(f"[Gateway Router] Key error for {key_entry['account']}: {e}. Rotating to next account...")
+                continue
 
 @app.post("/v1/chat/completions")
 @app.post("/chat/completions")

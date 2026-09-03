@@ -1,0 +1,34 @@
+{
+  "system": "LAR-OS Antigravity Gateway",
+  "version": "2.0.0",
+  "port": 18797,
+  "default_model": "gemini-3.5-flash-lite",
+  "pro_accounts": [
+    {
+      "account": "thuaquan228@gmail.com",
+      "agent_code": "TQ22CW",
+      "role": "Lead Architect & Core Engine",
+      "cloud_node": "Node 1 (16GB RAM)"
+    },
+    {
+      "account": "baohuynhgia0512@gmail.com",
+      "agent_code": "BH05QD",
+      "role": "Deep Reasoning & Security Logic",
+      "cloud_node": "Node 3 (Standby)"
+    },
+    {
+      "account": "giabaohuynh0512@gmail.com",
+      "agent_code": "GB12PE",
+      "role": "System Automation & Daemon",
+      "cloud_node": "Node 2 (8GB RAM)"
+    },
+    {
+      "account": "giabaohuynh.researcher@gmail.com",
+      "agent_code": "GB05RE",
+      "role": "Knowledge Discovery & Multimodal",
+      "cloud_node": "Node 4 (Standby)"
+    }
+  ],
+  "anti_crash_protocol": "ACP-V1",
+  "notebooklm_auth": "JIT_AUTO_AUTH_ZERO_HEARTBEAT"
+}
