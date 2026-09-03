@@ -1,0 +1,19 @@
+# Security & Credentials
+*keys*.json
+*.env
+*.pem
+*.key
+credentials/
+auth*.json
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+env/
+
+# OS / IDE
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
