@@ -19,11 +19,14 @@ Antigravity is the primary reasoning and decision-making authority for this code
 - **Context & Security Management:** Ensures zero secret leakage, evaluates regression risk.
 - **Review & Merge Gate:** Performs rigorous code review of all Jules contributions before merging.
 
-### Google Jules (Delegated Coding Worker)
-Google Jules is an autonomous, asynchronous coding worker operating in isolated cloud environments.
-- **Scoped Tasks:** Isolated bug fixes, test authoring, refactoring, dependency updates, issue implementation.
-- **Execution Lifecycle:** Clones repository $\to$ executes plan $\to$ runs local unit tests $\to$ opens Pull Request on GitHub.
-- **Rule of Engagement:** Never makes architectural changes without explicit Antigravity instructions. Never accesses or commits credentials.
+### Google Jules (Autonomous AI Co-Engineer & Senior Developer)
+Google Jules is an autonomous, asynchronous coding agent operating with expanded developer authority across isolated environments and cloud services:
+- **Expanded Scoped Tasks:** Architectural module authoring, complex refactoring, test suite development, feature implementation, and cross-file integration.
+- **Google AI Studio Integration:**
+  - Full access to Google AI Studio API via `google_ai_studio_client.py` (models: `gemini-3.6-flash`, `gemini-3.5-flash`, `gemini-2.5-pro`).
+  - Authorized to execute LLM extraction pipelines (`SPEC.md` Section 2), synthetic test fixtures, anti-sycophancy audits, and code verification loops.
+- **Execution Lifecycle:** Clones repository $\to$ executes plan $\to$ calls AI Studio when needed $\to$ runs local unit tests $\to$ outputs clean git patches and Pull Requests.
+- **Security Invariant:** Anti-Crash Protocol (ACP-V1) applies strictly. Zero credential leakage to git history or logs.
 
 ---
 
@@ -38,6 +41,7 @@ CONTEXT: [Only necessary files, interfaces, and design context]
 FILES / COMPONENTS: [Exact file paths to create or modify]
 CONSTRAINTS: [Strict boundaries, e.g. no external dependencies, preserve existing API]
 EXPECTED BEHAVIOR: [Detailed step-by-step functionality]
+AI STUDIO CAPABILITIES: [Enabled Gemini models, extraction tasks, synthetic data generation]
 TEST REQUIREMENTS: [Exact test commands, edge cases to cover, assertions required]
 ACCEPTANCE CRITERIA: [Checklist of pass/fail criteria]
 DO NOT MODIFY: [Files, endpoints, or configurations that must remain untouched]
@@ -46,21 +50,20 @@ DELIVERABLE: [Target branch, commit message, and PR title]
 
 ---
 
-## 3. Delegation Boundaries
+## 3. Delegation Boundaries & Elevated Authority
 
-### Delegate to Jules:
-- Adding or expanding unit/integration tests.
-- Refactoring well-bounded modules or utility functions.
-- Updating dependencies and resolving mechanical lint/type errors.
-- Implementing clear, well-specified GitHub issues.
-- Generating repetitive boilerplate or type definitions.
+### Full Authority Granted to Jules:
+- End-to-end module authoring and expanding test suites (`test_*.py`).
+- Calling Google AI Studio for automated text analysis, LLM extraction (`extract_research_object`), and evaluation.
+- Refactoring complex multi-file structures with backward compatibility.
+- Executing isolated test loops and performance benchmarks.
+- Implementing feature requests from GitHub issues and specifications.
 
-### DO NOT Delegate to Jules (Keep in Antigravity):
-- System architecture or protocol redesign.
-- Authentication mechanisms, API keys, and credential stores.
-- Destructive filesystem or database migrations.
-- Merging PRs or deploying to production.
-- Any task with high requirement ambiguity.
+### Kept in Antigravity (Chief Orchestrator Oversight):
+- Master security policy enforcement and final PR merge decisions.
+- Multi-account rotation pool management.
+- Multi-platform synchronization (GitHub, Hugging Face, Google Drive, Obsidian, Zenodo).
+- High-level architectural strategy and system governance.
 
 ---
 

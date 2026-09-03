@@ -106,17 +106,28 @@ class JulesOrchestrator:
         account: Optional[str] = None,
         source: str = DEFAULT_SOURCE,
         starting_branch: str = "main",
-        require_plan_approval: bool = False
+        require_plan_approval: bool = False,
+        ai_studio_access: bool = True
     ) -> Dict[str, Any]:
         """
         [COMMAND 1: DELEGATE TO JULES]
-        Formats structured delegation prompt and dispatches task to Google Jules.
+        Formats structured delegation prompt and dispatches task to Google Jules
+        with elevated permissions and Google AI Studio access enabled.
         """
         api_key, acc = self.get_api_key(account)
         
+        ai_studio_section = ""
+        if ai_studio_access:
+            ai_studio_section = """
+GOOGLE AI STUDIO ACCESS: [ENABLED]
+- Models Available: gemini-3.6-flash, gemini-3.5-flash, gemini-2.5-pro
+- Integration Client: google_ai_studio_client.py (import and invoke directly)
+- Capabilities: Automated text extraction (SPEC.md Section 2), synthetic fixtures, code self-verification
+"""
+
         structured_prompt = f"""# DELEGATED TASK SPECIFICATION: {task_id}
 Orchestrator: Google Antigravity (Chief Engineer)
-Worker: Google Jules (Delegated Coding Worker)
+Agent Authority: Google Jules (Autonomous AI Co-Engineer & Senior Developer)
 
 TASK ID: {task_id}
 OBJECTIVE: {objective}
@@ -126,7 +137,7 @@ CONTEXT:
 
 FILES / COMPONENTS:
 {chr(10).join(f"- {f}" for f in files)}
-
+{ai_studio_section}
 CONSTRAINTS:
 {constraints}
 
