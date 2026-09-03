@@ -1,0 +1,26 @@
+{
+  "objects": [
+    {
+      "id": "the_audit_that_missed_itself",
+      "title": "The Audit That Missed Itself",
+      "falsification_conditions": [
+        {"id": "F-Guillotine1", "text": "systematic review of corpus catalogue", "references_external_source": true, "source_note": "test"},
+        {"id": "F-Guillotine2", "text": "independent RiddleBench replication", "references_external_source": true, "source_note": "test"}
+      ],
+      "revisions": [
+        {"delta_type": "reaffirmed", "trigger": "Belsky et al. (2022) misattribution recurring uncorrected", "note": "", "source_note": "test"},
+        {"delta_type": "narrowed", "trigger": "abstract corrected from 'leading models' to named model", "note": "", "source_note": "test"}
+      ],
+      "self_referential_audit_present": false
+    },
+    {
+      "id": "the_load_bearing_test",
+      "title": "The Load-Bearing Test",
+      "falsification_conditions": [
+        {"id": "F-LBT1", "text": "universal pass across all six traditions", "references_external_source": false, "source_note": "test"}
+      ],
+      "revisions": [],
+      "self_referential_audit_present": false
+    }
+  ]
+}
