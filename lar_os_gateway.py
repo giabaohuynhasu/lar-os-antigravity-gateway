@@ -54,6 +54,11 @@ try:
 except Exception:
     dispatch_quad_ai_search = None
 
+try:
+    from google_drive_connector import drive_connector
+except Exception:
+    drive_connector = None
+
 CONFIG_PATH = SCRATCH / "gateway_config.json"
 KEYS_FILE = SCRATCH / "gateway_keys.json"
 
@@ -332,18 +337,27 @@ async def execute_model_request(model: str, messages: List[Dict[str, Any]], tool
 @app.get("/health")
 async def health_check():
     cooling = [acc for acc, h in ACCOUNT_HEALTH.items() if time.time() < h.get("cooldown_until", 0)]
+    drive_info = drive_connector.get_status() if drive_connector else {"status": "UNAVAILABLE"}
     return {
         "status": "ONLINE",
         "service": "LAR-OS Unified AI Gateway v3.0",
-        "architecture": "Non-destructive Dual-Protocol Proxy (Agentic Tool Calling + RTK + Smart Cooldown)",
+        "architecture": "Non-destructive Dual-Protocol Proxy (Agentic Tool Calling + RTK + Smart Cooldown + Drive Connector)",
         "uptime_seconds": int(time.time() - STATS["start_time"]),
         "total_requests": STATS["total_requests"],
         "cache_hits": STATS["cache_hits"],
         "tokens_saved_chars": STATS["tokens_saved_chars"],
         "active_models": len(MODELS_REGISTRY),
         "cooling_down_accounts": cooling,
-        "cache_entries": len(RESPONSE_CACHE)
+        "cache_entries": len(RESPONSE_CACHE),
+        "google_drive": drive_info
     }
+
+@app.get("/v1/drive/status")
+@app.get("/drive/status")
+async def get_drive_status():
+    if not drive_connector:
+        return {"status": "UNAVAILABLE", "message": "Google Drive connector module not loaded"}
+    return drive_connector.get_status()
 
 @app.get("/v1/models")
 @app.get("/models")
@@ -536,6 +550,11 @@ async def dashboard_page():
                     <div class="card-val" style="color: #10b981;">ACP-V1</div>
                     <div class="card-sub">Ổ cứng an toàn > 85GB</div>
                 </div>
+                <div class="card">
+                    <div class="card-title">Google Drive Connector (G:)</div>
+                    <div class="card-val" id="stat-drive" style="font-size: 18px; color: #38bdf8;">Đang kết nối...</div>
+                    <div class="card-sub" id="stat-drive-sub">Tự động đồng bộ đám mây</div>
+                </div>
             </div>
 
             <div class="section">
@@ -579,6 +598,12 @@ async def dashboard_page():
                     document.getElementById('stat-req').innerText = data.total_requests;
                     document.getElementById('stat-cache').innerText = data.cache_hits;
                     document.getElementById('stat-rtk').innerText = data.tokens_saved_chars + ' chars';
+                    if (data.google_drive && data.google_drive.status === 'CONNECTED') {
+                        document.getElementById('stat-drive').innerText = 'CONNECTED (' + data.google_drive.synced_files_count + ' tệp)';
+                        document.getElementById('stat-drive-sub').innerText = data.google_drive.mount_point + ' • ' + data.google_drive.free_gb + ' GB trống';
+                    } else {
+                        document.getElementById('stat-drive').innerText = 'OFFLINE';
+                    }
                 } catch(e) {}
             }
             updateStats();
