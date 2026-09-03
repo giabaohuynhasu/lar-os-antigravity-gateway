@@ -16,6 +16,7 @@ import sys
 import json
 import time
 import re
+import uuid
 import hashlib
 import asyncio
 import urllib.request
@@ -32,8 +33,19 @@ import uvicorn
 
 SCRATCH = Path(r"C:\Users\nswcl\.gemini\antigravity-ide\scratch")
 sys.path.insert(0, str(SCRATCH))
+sys.path.insert(0, str(SCRATCH / "lar-os-antigravity-gateway"))
 
 # Bridges
+try:
+    from m365_copilot_bridge import query_m365_copilot
+except Exception:
+    query_m365_copilot = None
+
+try:
+    from comet_perplexity_bridge import query_perplexity_comet
+except Exception:
+    query_perplexity_comet = None
+
 try:
     from opera_chatgpt_operator import operate_chatgpt_on_opera
 except Exception:
@@ -404,7 +416,6 @@ async def chat_completions(request: Request):
     return StreamingResponse(sse_generator(), media_type="text/event-stream")
 
 @app.post("/v1/messages")
-@app.post("/messages")
 async def anthropic_messages(request: Request):
     """Full Anthropic Messages & Tool-Use API for Claude Code CLI."""
     try:
@@ -466,6 +477,211 @@ async def anthropic_messages(request: Request):
         yield f"event: message_stop\ndata: {json.dumps({'type': 'message_stop'})}\n\n"
         
     return StreamingResponse(anthropic_sse_generator(), media_type="text/event-stream")
+
+# ==========================================
+# 8b. MODEL CONTEXT PROTOCOL (MCP) SSE & JSON-RPC
+# ==========================================
+MCP_SESSIONS: Dict[str, asyncio.Queue] = {}
+
+MCP_TOOLS_DEFINITIONS = [
+    {
+        "name": "m365_copilot_research",
+        "description": "Query Microsoft 365 Copilot (ASU Educational License) via CDP port 9223 for zero-quota deep reasoning, PubMed, Biorxiv, ClinicalTrials, and Wolfram.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "prompt": {"type": "string", "description": "The research query or reasoning prompt."}
+            },
+            "required": ["prompt"]
+        }
+    },
+    {
+        "name": "perplexity_comet_search",
+        "description": "Perform deep real-time academic search and citation synthesis using Perplexity AI inside Comet Browser on CDP port 9225.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "query": {"type": "string", "description": "The academic search query."}
+            },
+            "required": ["query"]
+        }
+    },
+    {
+        "name": "lar_os_query",
+        "description": "Query LAR-OS Unified Gateway reasoning engine (Gemini 3.5 / Claude 3.5 Sonnet translated).",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "prompt": {"type": "string", "description": "Prompt for LAR-OS"}
+            },
+            "required": ["prompt"]
+        }
+    },
+    {
+        "name": "third_order_audit",
+        "description": "Perform a Lakatosian Third-Order Audit on a scientific hypothesis with Goodhart defense.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "hypothesis": {"type": "string", "description": "Claim or framework to audit"}
+            },
+            "required": ["hypothesis"]
+        }
+    }
+]
+
+async def handle_mcp_jsonrpc(body: Dict[str, Any]) -> Dict[str, Any]:
+    msg_id = body.get("id")
+    method = body.get("method")
+    params = body.get("params", {})
+
+    if method == "initialize":
+        return {
+            "jsonrpc": "2.0",
+            "id": msg_id,
+            "result": {
+                "protocolVersion": "2024-11-05",
+                "capabilities": {
+                    "tools": {"listChanged": False},
+                    "prompts": {},
+                    "resources": {}
+                },
+                "serverInfo": {
+                    "name": "LAR-OS Antigravity Gateway",
+                    "version": "3.0.0"
+                }
+            }
+        }
+    elif method == "notifications/initialized":
+        return {"status": "ok"}
+    elif method == "ping":
+        return {"jsonrpc": "2.0", "id": msg_id, "result": {}}
+    elif method == "tools/list":
+        return {
+            "jsonrpc": "2.0",
+            "id": msg_id,
+            "result": {"tools": MCP_TOOLS_DEFINITIONS}
+        }
+    elif method == "tools/call":
+        tool_name = params.get("name")
+        args = params.get("arguments", {})
+        result_text = ""
+        try:
+            if tool_name == "m365_copilot_research":
+                if query_m365_copilot:
+                    res = await query_m365_copilot(args.get("prompt", ""))
+                    result_text = res.get("response", str(res))
+                else:
+                    result_text = "M365 Copilot bridge not initialized."
+            elif tool_name == "perplexity_comet_search":
+                if query_perplexity_comet:
+                    res = await query_perplexity_comet(args.get("query", ""))
+                    result_text = res.get("response", str(res))
+                else:
+                    result_text = "Comet Perplexity bridge not initialized."
+            elif tool_name == "third_order_audit":
+                try:
+                    from sandbox import audit_record, ConfidenceLevel
+                    rec = audit_record(
+                        hypothesis=args.get("hypothesis", ""),
+                        stated_exit_condition="Empirical replication failure",
+                        external_anchor="PubMed / ClinVar",
+                        confidence=ConfidenceLevel.HIGH,
+                        source_note="Audited via Opera Neon MCP"
+                    )
+                    result_text = json.dumps(rec.to_dict(), ensure_ascii=False, indent=2)
+                except Exception as ex:
+                    result_text = f"Audit engine error: {ex}"
+            else:
+                res = await execute_model_request("gemini-3.5-flash-lite", [{"role": "user", "content": args.get("prompt", "")}])
+                result_text = res.get("choices", [{}])[0].get("message", {}).get("content", "No response")
+        except Exception as e:
+            result_text = f"Error executing tool {tool_name}: {e}"
+
+        return {
+            "jsonrpc": "2.0",
+            "id": msg_id,
+            "result": {
+                "content": [{"type": "text", "text": result_text}]
+            }
+        }
+    else:
+        return {
+            "jsonrpc": "2.0",
+            "id": msg_id,
+            "error": {"code": -32601, "message": f"Method '{method}' not supported"}
+        }
+
+@app.get("/sse")
+async def mcp_sse_endpoint(request: Request):
+    """MCP Server-Sent Events Endpoint for Opera Neon, Claude Desktop, Cursor, etc."""
+    session_id = str(uuid.uuid4())
+    queue: asyncio.Queue = asyncio.Queue()
+    MCP_SESSIONS[session_id] = queue
+    log_event(f"🔌 MCP SSE Client connected! Session: {session_id}")
+
+    async def event_generator():
+        endpoint_url = f"/messages?session_id={session_id}"
+        yield f"event: endpoint\ndata: {endpoint_url}\n\n"
+        try:
+            while True:
+                try:
+                    msg = await asyncio.wait_for(queue.get(), timeout=15.0)
+                    yield f"event: message\ndata: {json.dumps(msg, ensure_ascii=False)}\n\n"
+                except asyncio.TimeoutError:
+                    yield ": ping\n\n"
+        except asyncio.CancelledError:
+            MCP_SESSIONS.pop(session_id, None)
+            log_event(f"🔌 MCP SSE Client disconnected. Session: {session_id}")
+
+    return StreamingResponse(
+        event_generator(),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "Connection": "keep-alive",
+            "X-Accel-Buffering": "no"
+        }
+    )
+
+@app.post("/messages")
+@app.post("/mcp/messages")
+async def mcp_messages_endpoint(request: Request):
+    """MCP Message endpoint for SSE-initiated sessions or standalone calls."""
+    try:
+        body = await request.json()
+    except Exception:
+        raise HTTPException(status_code=400, detail="Invalid JSON body")
+
+    if "messages" in body and "jsonrpc" not in body:
+        return await anthropic_messages(request)
+
+    session_id = request.query_params.get("session_id")
+    resp = await handle_mcp_jsonrpc(body)
+
+    if session_id and session_id in MCP_SESSIONS:
+        if body.get("method") != "notifications/initialized":
+            await MCP_SESSIONS[session_id].put(resp)
+        return Response(status_code=202)
+    else:
+        return JSONResponse(resp)
+
+@app.api_route("/mcp", methods=["GET", "POST"])
+async def mcp_unified_endpoint(request: Request):
+    """Unified MCP endpoint supporting both GET (spec) and POST (direct JSON-RPC)."""
+    if request.method == "POST":
+        body = await request.json()
+        resp = await handle_mcp_jsonrpc(body)
+        return JSONResponse(resp)
+    return JSONResponse({
+        "status": "online",
+        "protocol": "Model Context Protocol (MCP)",
+        "version": "2024-11-05",
+        "sse_endpoint": "/sse",
+        "messages_endpoint": "/messages",
+        "tools_count": len(MCP_TOOLS_DEFINITIONS),
+        "tools": [t["name"] for t in MCP_TOOLS_DEFINITIONS]
+    })
 
 # ==========================================
 # 9. EMBEDDED WEB DASHBOARD
