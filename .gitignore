@@ -1,5 +1,7 @@
 # Security & Credentials
 *keys*.json
+*credentials*.json
+*secret*
 *.env
 *.pem
 *.key
