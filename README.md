@@ -14,6 +14,7 @@ tags:
 # LAR-OS Antigravity Gateway (v3.0)
 **Autonomous Multi-Account AI Gateway, Claude Code Tool-Calling Bridge & JIT NotebookLM Authenticator**
 
+[![DOI](https://zenodo.org/badge/DOI/10.5281/zenodo.22283507.svg)](https://doi.org/10.5281/zenodo.22283507)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 [![Python 3.10+](https://img.shields.io/badge/Python-3.10%2B-blue.svg)](https://www.python.org/downloads/)
 [![Hugging Face](https://img.shields.io/badge/%F0%9F%A4%97%20Hugging%20Face-lar--os--antigravity--gateway-blue)](https://hf.co/Jun33550336/lar-os-antigravity-gateway)
