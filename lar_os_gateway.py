@@ -79,8 +79,10 @@ try:
 except Exception:
     drive_connector = None
 
-CONFIG_PATH = SCRATCH / "gateway_config.json"
-KEYS_FILE = SCRATCH / "gateway_keys.json"
+CURRENT_DIR = Path(__file__).resolve().parent
+CONFIG_PATH = CURRENT_DIR / "gateway_config.json" if (CURRENT_DIR / "gateway_config.json").exists() else SCRATCH / "gateway_config.json"
+KEYS_FILE = CURRENT_DIR / "gateway_keys.json" if (CURRENT_DIR / "gateway_keys.json").exists() else SCRATCH / "gateway_keys.json"
+
 
 def get_config():
     if CONFIG_PATH.exists():
