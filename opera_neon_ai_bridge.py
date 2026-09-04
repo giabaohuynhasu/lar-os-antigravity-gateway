@@ -24,10 +24,10 @@ AI_TARGETS = {
         "name": "ChatGPT (OpenAI)",
         "url": "https://chatgpt.com/",
         "login_url": "https://chatgpt.com/auth/login",
-        "input_selector": "#mobile-composer-prompt, #prompt-textarea, textarea[name='prompt'], textarea",
-        "send_selector": "button[aria-label='Gửi tin nhắn'], button[aria-label='Send message'], button[aria-label='Send prompt'], button[data-testid='send-button']",
-        "stop_selector": "button[aria-label='Dừng phát trực tuyến'], button[aria-label='Stop streaming'], button[data-testid='stop-button']",
-        "response_selector": "div[data-message-author-role='assistant'], div.agent-turn, article, div.markdown"
+        "input_selector": "#prompt-textarea, .ProseMirror, textarea",
+        "send_selector": "#composer-submit-button, button[data-testid='send-button'], button[aria-label='Gửi câu lệnh'], button[aria-label='Gửi tin nhắn'], button[aria-label='Send message']",
+        "stop_selector": "button[aria-label*='Dừng'], button[aria-label*='Stop'], button[data-testid='stop-button']",
+        "response_selector": "article, div[data-message-author-role='assistant'], div.agent-turn, div.markdown"
     },
     "deepseek": {
         "name": "DeepSeek-R1 / V3",
@@ -183,7 +183,10 @@ class OperaNeonBridge:
             if (!input) return {{ ok: false, error: "Input selector not found" }};
             
             input.focus();
-            if (input.tagName === 'TEXTAREA') {{
+            if (input.getAttribute('contenteditable') === 'true' || input.classList.contains('ProseMirror')) {{
+                document.execCommand('selectAll', false, null);
+                document.execCommand('insertText', false, {escaped_prompt});
+            }} else if (input.tagName === 'TEXTAREA') {{
                 var setter = Object.getOwnPropertyDescriptor(window.HTMLTextAreaElement.prototype, "value").set;
                 setter.call(input, {escaped_prompt});
                 input.dispatchEvent(new Event('input', {{ bubbles: true }}));
@@ -199,7 +202,9 @@ class OperaNeonBridge:
             }}
             
             // Look for send button
-            var sendBtn = document.querySelector("{cfg['send_selector']}");
+            var sendBtn = document.querySelector('#composer-submit-button') || 
+                          document.querySelector('button[data-testid="send-button"]') || 
+                          document.querySelector("{cfg['send_selector']}");
             if (sendBtn && !sendBtn.disabled) {{
                 sendBtn.click();
                 return {{ ok: true, method: "button_click" }};
@@ -217,14 +222,24 @@ class OperaNeonBridge:
             }}
         }})()
         """
+        # Record baseline message count before injecting
+        baseline_js = f"""
+        (function() {{
+            var els = document.querySelectorAll("{cfg['response_selector']}");
+            return els.length;
+        }})()
+        """
+        baseline_count = (await self.evaluate_js(ws_url, baseline_js)) or 0
+
         inject_res = await self.evaluate_js(ws_url, inject_js)
-        print(f"[+] Prompt injected into {engine}: {inject_res}")
+        print(f"[+] Prompt injected into {engine} (baseline {baseline_count}): {inject_res}")
         
         # Poll for response completion
         print(f"[+] Waiting for {engine} response (up to {timeout_seconds}s)...")
         start_time = time.time()
         last_text = ""
         stable_count = 0
+        has_streamed = False
         
         while time.time() - start_time < timeout_seconds:
             await asyncio.sleep(2)
@@ -245,8 +260,13 @@ class OperaNeonBridge:
                 data = json.loads(scrape_val)
                 current_text = data.get("text", "")
                 is_streaming = data.get("is_streaming", False)
+                el_count = data.get("count", 0)
                 
-                if current_text and current_text == last_text and not is_streaming:
+                if is_streaming:
+                    has_streamed = True
+
+                # Valid completion if new turn appeared and streaming stopped
+                if (el_count > baseline_count or has_streamed) and current_text and current_text == last_text and not is_streaming:
                     stable_count += 1
                     if stable_count >= 2:
                         print(f"[+] Response completed ({len(current_text)} chars)!")
