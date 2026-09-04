@@ -259,10 +259,18 @@ async def execute_model_request(model: str, messages: List[Dict[str, Any]], tool
         set_cached_response(p_hash, ans)
         return ans
 
-    if "opera" in model_lower or "chatgpt" in model_lower:
-        if operate_chatgpt_on_opera:
-            await operate_chatgpt_on_opera(compacted_query)
-            return {"text": f"Prompt successfully dispatched to ChatGPT / GPT 5.6 Luna on Opera Neon: '{compacted_query[:80]}...'.", "tool_calls": []}
+    if "chatgpt" in model_lower or "opera" in model_lower:
+        if consult_opera_neon:
+            res = await consult_opera_neon(engine="chatgpt", prompt=compacted_query)
+            ans_text = res.get("response") or res.get("message") or str(res)
+            return {"text": ans_text, "tool_calls": []}
+
+    if "claude" in model_lower:
+        if consult_opera_neon:
+            res = await consult_opera_neon(engine="claude", prompt=compacted_query)
+            ans_text = res.get("response") or res.get("message") or str(res)
+            return {"text": ans_text, "tool_calls": []}
+
 
     # Core Gemini Multi-Account Pool
     keys_pool = []
