@@ -20,6 +20,11 @@ import uuid
 import hashlib
 import asyncio
 import urllib.request
+import enum
+import random
+import contextlib
+import subprocess
+from dataclasses import dataclass, field
 from typing import Optional, List, Dict, Any, AsyncGenerator
 from pathlib import Path
 
@@ -130,29 +135,246 @@ def rtk_compact_text(text: str) -> tuple[str, int]:
     return compacted, saved
 
 # ==========================================
-# 3. ACCOUNT HEALTH & COOLDOWN (from CLIProxyAPI)
+# 3. STANDARDIZED 3-STATE CIRCUIT BREAKER + JITTER (Phase 2)
 # ==========================================
-ACCOUNT_HEALTH: Dict[str, Dict[str, Any]] = {}
-COOLDOWN_SECONDS = 60
+COOLDOWN_429 = 60.0
+COOLDOWN_TIMEOUT = 30.0
+COOLDOWN_5XX = 15.0
+JITTER_MAX = 15.0
 
+class CircuitState(str, enum.Enum):
+    CLOSED = "closed"
+    OPEN = "open"
+    HALF_OPEN = "half_open"
+
+class FailureKind(str, enum.Enum):
+    HTTP_429 = "http_429"
+    TIMEOUT = "timeout"
+    HTTP_5XX = "http_5xx"
+
+@dataclass
+class CircuitBreaker:
+    """
+    Asyncio-safe, non-blocking 3-state circuit breaker with jitter.
+    Invariants:
+      - OPEN providers are never routed to.
+      - Exactly one probe allowed when HALF_OPEN.
+      - Lock is never held across an await.
+      - Cooldown uses monotonic time to prevent clock skew.
+    """
+    name: str
+    state: CircuitState = CircuitState.CLOSED
+    opened_until: float = 0.0
+    failure_count: int = 0
+    probe_in_flight: bool = False
+    _lock: asyncio.Lock = field(default_factory=asyncio.Lock)
+
+    def _now(self) -> float:
+        return time.monotonic()
+
+    @staticmethod
+    def _cooldown_for(kind: FailureKind) -> float:
+        if kind == FailureKind.HTTP_429:
+            return COOLDOWN_429
+        elif kind == FailureKind.TIMEOUT:
+            return COOLDOWN_TIMEOUT
+        elif kind == FailureKind.HTTP_5XX:
+            return COOLDOWN_5XX
+        return COOLDOWN_TIMEOUT
+
+    async def allow_request(self) -> bool:
+        async with self._lock:
+            now = self._now()
+            if self.state == CircuitState.CLOSED:
+                return True
+            if self.state == CircuitState.OPEN:
+                if now < self.opened_until:
+                    return False
+                # Cooldown expired -> enter HALF_OPEN test mode
+                self.state = CircuitState.HALF_OPEN
+                self.probe_in_flight = False
+            if self.state == CircuitState.HALF_OPEN:
+                if self.probe_in_flight:
+                    return False
+                self.probe_in_flight = True
+                return True
+            return False
+
+    async def record_success(self) -> None:
+        async with self._lock:
+            self.state = CircuitState.CLOSED
+            self.opened_until = 0.0
+            self.failure_count = 0
+            self.probe_in_flight = False
+
+    async def record_failure(self, kind: FailureKind = FailureKind.TIMEOUT) -> None:
+        cooldown = self._cooldown_for(kind)
+        jitter = random.uniform(0.0, JITTER_MAX)
+        duration = cooldown + jitter
+        async with self._lock:
+            self.failure_count += 1
+            self.state = CircuitState.OPEN
+            self.opened_until = self._now() + duration
+            self.probe_in_flight = False
+            log_event(f"⚠️ Circuit '{self.name}' -> OPEN for {duration:.1f}s (Reason: {kind.value}, Jitter: +{jitter:.1f}s)")
+
+    async def snapshot(self) -> dict:
+        async with self._lock:
+            remaining = max(0.0, self.opened_until - self._now())
+            return {
+                "name": self.name,
+                "state": self.state.value,
+                "failure_count": self.failure_count,
+                "cooldown_remaining_sec": round(remaining, 1),
+                "probe_in_flight": self.probe_in_flight
+            }
+
+CIRCUITS: Dict[str, CircuitBreaker] = {}
+
+def get_circuit(name: str) -> CircuitBreaker:
+    if name not in CIRCUITS:
+        CIRCUITS[name] = CircuitBreaker(name=name)
+    return CIRCUITS[name]
+
+# Backward compatibility wrappers
 def is_account_healthy(account: str) -> bool:
-    info = ACCOUNT_HEALTH.get(account)
-    if not info:
-        return True
-    if time.time() < info.get("cooldown_until", 0):
+    cb = get_circuit(account)
+    if cb.state == CircuitState.OPEN and cb._now() < cb.opened_until:
         return False
     return True
 
-def record_account_failure(account: str, error: str):
-    info = ACCOUNT_HEALTH.setdefault(account, {"cooldown_until": 0, "failures": 0})
-    info["failures"] += 1
-    info["cooldown_until"] = time.time() + COOLDOWN_SECONDS
-    log_event(f"⚠️ Account '{account}' entered 60s cooldown due to: {error}")
+# ==========================================
+# 3.1. TINY PROCESS WATCHDOG (Phase 1)
+# ==========================================
+CLIPROXY_EXE = SCRATCH / "cliproxyapi" / "cli-proxy-api.exe"
+CLIPROXY_CONFIG = SCRATCH / "cliproxyapi" / "config.yaml"
 
-def record_account_success(account: str):
-    if account in ACCOUNT_HEALTH:
-        ACCOUNT_HEALTH[account]["failures"] = 0
-        ACCOUNT_HEALTH[account]["cooldown_until"] = 0
+class CLIProxyWatchdog:
+    """
+    Owns and supervises cli-proxy-api.exe child process.
+    Properties:
+      - Fully asynchronous, zero blocking on FastAPI event loop
+      - Periodic liveness polling every 10s
+      - Auto-restart with Exponential Backoff (1s -> 2s -> 4s ... max 60s)
+      - Graceful shutdown on Gateway exit
+      - Ultra-lightweight footprint (< 1MB RAM, ~0% CPU)
+    """
+    def __init__(self, executable: Path, config: Path, interval: float = 10.0):
+        self.executable = executable
+        self.config = config
+        self.interval = interval
+        self._process: Optional[asyncio.subprocess.Process] = None
+        self._task: Optional[asyncio.Task] = None
+        self._stop_event = asyncio.Event()
+        self._restart_delay = 1.0
+        self._total_restarts = 0
+
+    async def start(self) -> None:
+        if self._task is not None and not self._task.done():
+            return
+        self._stop_event.clear()
+        if not self.executable.is_file():
+            log_event(f"[-] CLIProxy executable not found at: {self.executable}")
+            return
+        self._task = asyncio.create_task(self._run(), name="cliproxy-watchdog")
+        log_event(f"🛡️ CLIProxyWatchdog task started (polling interval: {self.interval}s)")
+
+    async def stop(self) -> None:
+        self._stop_event.set()
+        task = self._task
+        if task is not None:
+            try:
+                await asyncio.wait_for(asyncio.shield(task), timeout=5.0)
+            except asyncio.TimeoutError:
+                task.cancel()
+                with contextlib.suppress(asyncio.CancelledError):
+                    await task
+        self._task = None
+        await self._terminate_process()
+
+    async def _spawn(self) -> None:
+        if self._stop_event.is_set() or self._process is not None:
+            return
+        log_event(f"🚀 Spawning CLIProxyAPI daemon: {self.executable.name}...")
+        self._process = await asyncio.create_subprocess_exec(
+            str(self.executable),
+            "-config",
+            str(self.config),
+            stdin=asyncio.subprocess.DEVNULL,
+            stdout=asyncio.subprocess.DEVNULL,
+            stderr=asyncio.subprocess.DEVNULL
+        )
+        self._restart_delay = 1.0
+        log_event(f"✓ CLIProxyAPI spawned successfully (PID: {self._process.pid})")
+
+    async def _terminate_process(self) -> None:
+        process = self._process
+        if process is None:
+            return
+        self._process = None
+        if process.returncode is not None:
+            return
+        with contextlib.suppress(ProcessLookupError):
+            process.terminate()
+        try:
+            await asyncio.wait_for(process.wait(), timeout=5.0)
+            log_event("✓ CLIProxyAPI terminated gracefully.")
+        except asyncio.TimeoutError:
+            with contextlib.suppress(ProcessLookupError):
+                process.kill()
+            with contextlib.suppress(asyncio.TimeoutError):
+                await asyncio.wait_for(process.wait(), timeout=2.0)
+            log_event("⚠️ CLIProxyAPI force-killed after timeout.")
+
+    async def _run(self) -> None:
+        while not self._stop_event.is_set():
+            if self._process is None:
+                try:
+                    await self._spawn()
+                except Exception as e:
+                    log_event(f"[-] Failed to spawn CLIProxyAPI: {e}. Backoff {self._restart_delay}s...")
+                    await self._sleep_or_stop(self._restart_delay)
+                    self._restart_delay = min(self._restart_delay * 2.0, 60.0)
+                    continue
+
+            stopped = await self._sleep_or_stop(self.interval)
+            if stopped:
+                break
+
+            process = self._process
+            if process is None:
+                continue
+
+            returncode = process.returncode
+            if returncode is None:
+                # Still running healthy
+                continue
+
+            # Process crashed / stopped unexpectedly
+            self._process = None
+            self._total_restarts += 1
+            log_event(f"⚠️ CLIProxyAPI exited with code {returncode}! Watchdog auto-restart in {self._restart_delay}s (Restart #{self._total_restarts})...")
+            await self._sleep_or_stop(self._restart_delay)
+            self._restart_delay = min(self._restart_delay * 2.0, 60.0)
+
+    async def _sleep_or_stop(self, seconds: float) -> bool:
+        try:
+            await asyncio.wait_for(self._stop_event.wait(), timeout=seconds)
+            return True
+        except asyncio.TimeoutError:
+            return False
+
+    def status(self) -> dict:
+        process = self._process
+        if process is None:
+            return {"running": False, "pid": None, "total_restarts": self._total_restarts, "restart_delay": self._restart_delay}
+        return {
+            "running": process.returncode is None,
+            "pid": process.pid,
+            "returncode": process.returncode,
+            "total_restarts": self._total_restarts,
+            "restart_delay": self._restart_delay
+        }
 
 # ==========================================
 # 4. BOUNDED LRU CACHE (ACP-V1 Strict)
@@ -181,7 +403,7 @@ def set_cached_response(prompt_hash: str, response: Any):
 # ==========================================
 # 5. FASTAPI APP & REGISTRY
 # ==========================================
-app = FastAPI(title="LAR-OS Unified AI Gateway v3.0", version="3.0.0-agentic")
+app = FastAPI(title="LAR-OS Unified AI Gateway v3.1", version="3.1.0-self-healing")
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -189,6 +411,18 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+cli_watchdog = CLIProxyWatchdog(executable=CLIPROXY_EXE, config=CLIPROXY_CONFIG)
+
+@app.on_event("startup")
+async def on_startup():
+    await cli_watchdog.start()
+    log_event("🚀 LAR-OS Gateway v3.1 online. CLIProxyWatchdog active on port 18798.")
+
+@app.on_event("shutdown")
+async def on_shutdown():
+    await cli_watchdog.stop()
+    log_event("🛑 LAR-OS Gateway shutdown. CLIProxyWatchdog cleanly stopped.")
 
 MODELS_REGISTRY = [
     {"id": "gemini-3.5-flash-lite", "object": "model", "created": 1780000000, "owned_by": "google", "description": "Google Gemini 3.5 Flash-Lite (High throughput, 1M context, sub-agent loop)"},
@@ -349,15 +583,11 @@ async def execute_model_request(model: str, messages: List[Dict[str, Any]], tool
     global _round_robin_counter
     target_model = "gemini-3.5-flash-lite" if ("flash" in model or "2.5" in model or "claude" in model) else model
     
-    healthy_keys = [k for k in keys_pool if is_account_healthy(k["account"])]
-    if not healthy_keys:
-        log_event("🔄 All keys in cooldown. Resetting cooldowns for failover...")
-        healthy_keys = keys_pool
-
-    n_keys = len(healthy_keys)
-    start_idx = _round_robin_counter % n_keys
-    _round_robin_counter += 1
-    ordered_pool = healthy_keys[start_idx:] + healthy_keys[:start_idx]
+    healthy_keys = []
+    for k in keys_pool:
+        cb = get_circuit(k["account"])
+        if await cb.allow_request():
+            healthy_keys.append(k)
 
     # Convert tools if provided
     gemini_tools = translate_anthropic_tools_to_gemini(tools) if tools else None
@@ -396,37 +626,59 @@ async def execute_model_request(model: str, messages: List[Dict[str, Any]], tool
                 return {"text": resp_text, "tool_calls": tool_calls}
         return None
 
-    for key_entry in ordered_pool:
-        acc = key_entry["account"]
-        try:
-            res_dict = await asyncio.wait_for(
-                asyncio.to_thread(_do_request_sync, key_entry["key"], target_model, compacted_query, gemini_tools),
-                timeout=12.5
-            )
-            if res_dict:
-                record_account_success(acc)
-                log_event(f"✓ FULFILLED by {acc} ({target_model}) | RTK: -{saved} chars")
-                set_cached_response(p_hash, res_dict)
-                return res_dict
-        except Exception as e:
-            record_account_failure(acc, str(e))
-            continue
+    if healthy_keys:
+        n_keys = len(healthy_keys)
+        start_idx = _round_robin_counter % n_keys
+        _round_robin_counter += 1
+        ordered_pool = healthy_keys[start_idx:] + healthy_keys[:start_idx]
+
+        for key_entry in ordered_pool:
+            acc = key_entry["account"]
+            cb = get_circuit(acc)
+            try:
+                res_dict = await asyncio.wait_for(
+                    asyncio.to_thread(_do_request_sync, key_entry["key"], target_model, compacted_query, gemini_tools),
+                    timeout=12.5
+                )
+                if res_dict:
+                    await cb.record_success()
+                    log_event(f"✓ FULFILLED by {acc} ({target_model}) | RTK: -{saved} chars")
+                    set_cached_response(p_hash, res_dict)
+                    return res_dict
+            except Exception as e:
+                err_msg = str(e).lower()
+                if "429" in err_msg or "resource_exhausted" in err_msg:
+                    kind = FailureKind.HTTP_429
+                elif "500" in err_msg or "503" in err_msg or "502" in err_msg:
+                    kind = FailureKind.HTTP_5XX
+                else:
+                    kind = FailureKind.TIMEOUT
+                await cb.record_failure(kind)
+                continue
+    else:
+        log_event("🔄 All primary Gemini circuits in OPEN state. Fast-falling back to Tier-4...")
 
     # Tier 4: Antigravity OAuth Failover (100% Free Uncapped Backup via CLIProxyAPI)
-    log_event("🛡️ Primary keys exhausted/cooling down. Activating TIER 4 FAILOVER (CLIProxyAPI Antigravity)...")
-    try:
-        failover_res = await asyncio.wait_for(
-            asyncio.to_thread(_call_cliproxy_sync, target_model, compacted_query, tools),
-            timeout=30.0
-        )
-        if failover_res and failover_res.get("text"):
-            log_event(f"✨ TIER 4 FULFILLED by Antigravity Free Proxy ({target_model})!")
-            set_cached_response(p_hash, failover_res)
-            return failover_res
-    except Exception as e_failover:
-        log_event(f"❌ Tier 4 Failover error: {e_failover}")
+    t4_cb = get_circuit("tier4_cliproxyapi")
+    if await t4_cb.allow_request():
+        log_event("🛡️ Activating TIER 4 FAILOVER (CLIProxyAPI Antigravity)...")
+        try:
+            failover_res = await asyncio.wait_for(
+                asyncio.to_thread(_call_cliproxy_sync, target_model, compacted_query, tools),
+                timeout=30.0
+            )
+            if failover_res and failover_res.get("text"):
+                await t4_cb.record_success()
+                log_event(f"✨ TIER 4 FULFILLED by Antigravity Free Proxy ({target_model})!")
+                set_cached_response(p_hash, failover_res)
+                return failover_res
+        except Exception as e_failover:
+            err_msg = str(e_failover).lower()
+            kind = FailureKind.HTTP_429 if "429" in err_msg else FailureKind.TIMEOUT
+            await t4_cb.record_failure(kind)
+            log_event(f"❌ Tier 4 Failover error: {e_failover}")
 
-    return {"text": "[LAR-OS Gateway Failover] All active accounts and failover proxies cooling down. Retry shortly.", "tool_calls": []}
+    return {"text": "[LAR-OS Gateway Failover] All active accounts and failover circuits are currently cooling down. Retry shortly.", "tool_calls": []}
 
 # ==========================================
 # 8. API ENDPOINTS
@@ -434,19 +686,21 @@ async def execute_model_request(model: str, messages: List[Dict[str, Any]], tool
 @app.get("/")
 @app.get("/health")
 async def health_check():
-    cooling = [acc for acc, h in ACCOUNT_HEALTH.items() if time.time() < h.get("cooldown_until", 0)]
+    circuits_snapshot = [await cb.snapshot() for cb in CIRCUITS.values()]
     drive_info = drive_connector.get_status() if drive_connector else {"status": "UNAVAILABLE"}
+    watchdog_stat = cli_watchdog.status()
     return {
         "status": "ONLINE",
-        "service": "LAR-OS Unified AI Gateway v3.0",
-        "architecture": "Non-destructive Dual-Protocol Proxy (Agentic Tool Calling + RTK + Smart Cooldown + Drive Connector)",
+        "service": "LAR-OS Unified AI Gateway v3.1 (Self-Healing)",
+        "architecture": "Supervised 4-Tier Heterogeneous Redundancy + 3-State Circuit Breakers",
         "uptime_seconds": int(time.time() - STATS["start_time"]),
         "total_requests": STATS["total_requests"],
         "cache_hits": STATS["cache_hits"],
         "tokens_saved_chars": STATS["tokens_saved_chars"],
         "active_models": len(MODELS_REGISTRY),
-        "cooling_down_accounts": cooling,
-        "tier4_failover": "ONLINE (Port 18798, Antigravity 100% Free)",
+        "circuits": circuits_snapshot,
+        "tier4_watchdog": watchdog_stat,
+        "tier4_failover": "ONLINE (Supervised by Watchdog, Port 18798)" if watchdog_stat.get("running") else "OFFLINE",
         "cache_entries": len(RESPONSE_CACHE),
         "google_drive": drive_info
     }
