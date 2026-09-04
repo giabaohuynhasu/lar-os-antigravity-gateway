@@ -167,35 +167,45 @@ def interpret_vibe(args: List[str]) -> VibeResult:
             notes.append("Mô hình mặc định: Gemini 3.5 Flash (Tốc độ cao qua 5-Pro Quota Pool)")
 
     # 5. Extract Email Dispatch Intent
-    send_email = manual_email
-    email_patterns = [
-        r"(gui|send|chuyen|phat)\s+(qua\s+)?(mail|gmail|email|thu)",
-        r"mail\s+(cho\s+)?(tui|toi|tao|em|anh|me)",
-        r"email\s+(cho\s+)?(tui|toi|tao|em|anh|me)",
-        r"(bao cao|report)\s+(qua\s+)?(mail|gmail|email)",
-        r"gui\s+vao\s+(mail|gmail|email|hop thu)",
-        r"nhan\s+qua\s+(mail|gmail|email)"
-    ]
+    send_email = manual_email or os.environ.get("AGY_AUTO_EMAIL", "").lower() in ("1", "true", "yes")
+
+    # Prefix match: "mail ...", "gui mail ...", "email ..."
+    prefix_email_match = re.match(r"^(gui\s+)?(mail|gmail|email)\s*[:,-]?\s+", working_text, flags=re.IGNORECASE)
+    if prefix_email_match:
+        send_email = True
+        working_text = working_text[prefix_email_match.end():].strip()
 
     working_norm = strip_accents(working_text)
-    matched_email = False
-    for pat in email_patterns:
-        if re.search(pat, working_norm):
-            matched_email = True
-            break
+    is_tech_email = bool(re.search(r"\b(regex|validate|validation|ham|form|input|type|dia chi)\s+(mail|email|gmail)\b", working_norm) or 
+                         re.search(r"\b(mail|email|gmail)\s+(regex|validation|format)\b", working_norm))
 
-    if matched_email:
-        send_email = True
-        notes.append("Nhận diện ý định gửi email -> Tự động phát báo cáo tới thuaquan228@gmail.com")
+    if not is_tech_email:
+        email_patterns = [
+            r"\b(gui|send|chuyen|phat|forward)\s+(qua\s+|vao\s+|ve\s+|toi\s+)?(mail|gmail|email|thu)\b",
+            r"\b(mail|gmail|email)\s+(cho|ve|vao|toi)\s+(tui|toi|tao|em|anh|minh|to|me|ban)\b",
+            r"\b(bao cao|report|ket qua|kq)\s+(qua\s+|vao\s+|ve\s+)?(mail|gmail|email)\b",
+            r"\b(nhan|lay)\s+(qua\s+)?(mail|gmail|email)\b",
+            r"\b(mail|gmail|email)\s+(nhe|nha|giup|ho|nhan|ngay)\b",
+            r"\b(nho|kem)\s+gui\s+(mail|gmail|email)\b",
+            r"\b(gui|send)\s+(mail|gmail|email)\b",
+        ]
+        for pat in email_patterns:
+            if re.search(pat, working_norm):
+                send_email = True
+                break
+
+    if send_email:
+        notes.append("✉️ Tự động gửi báo cáo qua Gmail (thuaquan228@gmail.com)")
         # Clean email phrase from end of prompt to avoid confusing the LLM
         clean_prompt = re.sub(
-            r"\s*(roi|kem|dong thoi)?\s*(gui|send|chuyen)?\s*(qua\s+)?(mail|gmail|email|thu)(\s+(cho\s+)?(tui|toi|tao|em|anh|me))?[\.!]?$",
+            r"\s*(roi|kem|dong thoi|va)?\s*(nho\s+)?(gui|send|chuyen)?\s*(qua|vao|ve|cho)?\s*(mail|gmail|email|thu)(\s+(cho\s+)?(tui|toi|tao|em|anh|minh|me|to))?(\s+(nhe|nha|giup|ho|ngay))?[\.!]?$",
             "",
             working_text,
             flags=re.IGNORECASE
         ).strip()
         if clean_prompt:
             working_text = clean_prompt
+
 
     return VibeResult(
         action="query",

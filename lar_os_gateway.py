@@ -403,6 +403,35 @@ async def chat_completions(request: Request):
     result = await execute_model_request(model, messages)
     full_text = result.get("text", "")
     
+    # Auto-dispatch email if requested by client (e.g. Termux / Termius)
+    if body.get("email") or body.get("send_email"):
+        try:
+            from gmail_spark_sender import GmailSparkSender
+            from gemini_spark_bridge import GeminiSparkBridge
+            sender = GmailSparkSender()
+            bridge = GeminiSparkBridge()
+            prompt_summary = messages[-1].get("content", "") if messages else "Prompt"
+            subject = f"[Antigravity Mobile] Báo cáo: {str(prompt_summary)[:45]} - {time.strftime('%H:%M %d/%m')}"
+            html_report = f"""
+            <div style="font-family: system-ui, sans-serif; max-width: 680px; margin: 0 auto; background-color: #0d1117; color: #e6edf3; padding: 24px; border-radius: 12px;">
+                <h2 style="color: #58a6ff;">⚡ Antigravity Mobile Report</h2>
+                <p style="color: #8b949e;">Triggered via Termux/Termius &bull; Model: <b>{model}</b></p>
+                <div style="background-color: #161b22; padding: 14px; border-radius: 8px; margin-bottom: 18px;">
+                    <b style="color: #7ee787;">Lệnh:</b>
+                    <p style="margin: 6px 0 0 0; color: #c9d1d9;">{prompt_summary}</p>
+                </div>
+                <div style="background-color: #161b22; padding: 16px; border-radius: 8px;">
+                    <b style="color: #58a6ff;">Kết quả:</b>
+                    <div style="line-height: 1.6; margin-top: 8px; white-space: pre-wrap;">{full_text}</div>
+                </div>
+            </div>
+            """
+            bridge.save_report(subject, full_text, html_report)
+            asyncio.create_task(sender.send_report_email(subject, html_report, recipient="thuaquan228@gmail.com"))
+            log_event(f"📧 Auto-dispatched email report for prompt: '{str(prompt_summary)[:30]}...'")
+        except Exception as e:
+            log_event(f"⚠️ Email dispatch error: {e}")
+
     if not stream:
         return {
             "id": req_id,
@@ -412,6 +441,7 @@ async def chat_completions(request: Request):
             "choices": [{"index": 0, "message": {"role": "assistant", "content": full_text}, "finish_reason": "stop"}],
             "usage": {"prompt_tokens": len(str(messages)) // 4, "completion_tokens": len(full_text) // 4, "total_tokens": (len(str(messages)) + len(full_text)) // 4}
         }
+
         
     async def sse_generator():
         words = full_text.split(" ")
