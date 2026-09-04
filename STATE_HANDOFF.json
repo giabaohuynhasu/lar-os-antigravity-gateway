@@ -1,12 +1,12 @@
 {
   "header": {
     "algorithm": "HMAC-SHA256",
-    "signature": "fa0cad12938a12466e9d794b15053730cafe0bad9f2770577a64f1b0c69d892a",
-    "created_at": "2026-09-04T02:02:49.323281+00:00"
+    "signature": "b7df964dc6d294a2279c57a8cc19129ac94217cdf92ad4f31c85844acd76cfc3",
+    "created_at": "2026-09-04T03:16:02.517907+00:00"
   },
   "payload": {
     "protocol_version": "AHCP-V1.0",
-    "timestamp": "2026-09-04T02:02:49.323281+00:00",
+    "timestamp": "2026-09-04T03:16:02.517907+00:00",
     "source_instance": "TEST-INSTANCE-01",
     "reason": "Unit test execution",
     "system_status": {

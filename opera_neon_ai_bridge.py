@@ -73,8 +73,22 @@ class OperaNeonBridge:
 
     def get_or_create_tab(self, target_domain: str, initial_url: str):
         tabs = self.list_tabs()
-        keyword = target_domain.split(".")[0] if "." in target_domain else target_domain
-        matching = [t for t in tabs if target_domain in t.get("url", "") or keyword in t.get("url", "")]
+        # Extract primary domain keyword (e.g. 'deepseek' from 'chat.deepseek.com', 'kimi' from 'www.kimi.com')
+        clean_parts = [p for p in target_domain.split(".") if p]
+        if len(clean_parts) >= 3 and clean_parts[-2] in ("co", "com", "net", "org", "edu", "gov") and clean_parts[-1] in ("vn", "uk", "jp", "au"):
+            keyword = clean_parts[-3].lower()
+        elif len(clean_parts) >= 2:
+            keyword = clean_parts[-2].lower()
+        else:
+            keyword = target_domain.lower()
+            
+        matching = [
+            t for t in tabs 
+            if t.get("type") == "page" and (
+                target_domain in t.get("url", "") or 
+                keyword in urllib.parse.urlparse(t.get("url", "")).netloc.lower()
+            )
+        ]
         if matching:
             return matching[0]
         # Create new tab using PUT method
@@ -178,7 +192,7 @@ class OperaNeonBridge:
         # Inject prompt using native property setter to bypass React 18 synthetic wrapper
         escaped_prompt = json.dumps(prompt)
         inject_js = f"""
-        (function() {{
+        (async function() {{
             var input = document.querySelector("{cfg['input_selector']}");
             if (!input) return {{ ok: false, error: "Input selector not found" }};
             
@@ -186,6 +200,7 @@ class OperaNeonBridge:
             if (input.getAttribute('contenteditable') === 'true' || input.classList.contains('ProseMirror')) {{
                 document.execCommand('selectAll', false, null);
                 document.execCommand('insertText', false, {escaped_prompt});
+                input.dispatchEvent(new Event('input', {{ bubbles: true }}));
             }} else if (input.tagName === 'TEXTAREA') {{
                 var setter = Object.getOwnPropertyDescriptor(window.HTMLTextAreaElement.prototype, "value").set;
                 setter.call(input, {escaped_prompt});
@@ -201,25 +216,28 @@ class OperaNeonBridge:
                 input.dispatchEvent(new Event('input', {{ bubbles: true }}));
             }}
             
-            // Look for send button
-            var sendBtn = document.querySelector('#composer-submit-button') || 
-                          document.querySelector('button[data-testid="send-button"]') || 
-                          document.querySelector("{cfg['send_selector']}");
-            if (sendBtn && !sendBtn.disabled) {{
-                sendBtn.click();
-                return {{ ok: true, method: "button_click" }};
-            }} else {{
-                var enterEvent = new KeyboardEvent('keydown', {{
-                    key: 'Enter',
-                    code: 'Enter',
-                    keyCode: 13,
-                    which: 13,
-                    bubbles: true,
-                    cancelable: true
-                }});
-                input.dispatchEvent(enterEvent);
-                return {{ ok: true, method: "enter_key" }};
+            // Poll for send button to become enabled
+            for (var i = 0; i < 12; i++) {{
+                await new Promise(r => setTimeout(r, 100));
+                var sendBtn = document.querySelector('#composer-submit-button') || 
+                              document.querySelector('button[data-testid="send-button"]') || 
+                              document.querySelector("{cfg['send_selector']}");
+                if (sendBtn && !sendBtn.disabled && sendBtn.getAttribute('aria-disabled') !== 'true') {{
+                    sendBtn.click();
+                    return {{ ok: true, method: "button_click", tries: i }};
+                }}
             }}
+            
+            var enterEvent = new KeyboardEvent('keydown', {{
+                key: 'Enter',
+                code: 'Enter',
+                keyCode: 13,
+                which: 13,
+                bubbles: true,
+                cancelable: true
+            }});
+            input.dispatchEvent(enterEvent);
+            return {{ ok: true, method: "enter_key" }};
         }})()
         """
         # Record baseline message count before injecting
