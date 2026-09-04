@@ -81,3 +81,14 @@ DELIVERABLE: [Target branch, commit message, and PR title]
    - **SECURITY:** PASS / FAIL
    - **REGRESSION RISK:** LOW / MEDIUM / HIGH
    - **RECOMMENDATION:** MERGE / REQUEST CHANGES / REJECT
+
+---
+
+## 5. Mandatory ChatGPT Consultation Protocol (User Directive)
+
+**LỆNH BẮT BUỘC: LUÔN THAM VẤN CHATGPT CHO MỌI TASK**
+
+Mọi tác vụ kỹ thuật, kiến trúc, coding, refactoring, debug và tối ưu hóa hệ thống đều phải tuân thủ nghiêm ngặt quy trình tham vấn ChatGPT:
+1. **Tham vấn đầu tiên:** Antigravity/Jules phải kết nối với ChatGPT qua Opera Neon CDP (cổng 9224) để lấy tư vấn phương án kỹ thuật và code mẫu trước khi triển khai.
+2. **Ràng buộc vàng:** Mọi giải pháp từ ChatGPT phải tuân thủ điều kiện **"KHÔNG ĐƯỢC NẶNG MÁY"** (RAM < 45MB, CPU idle ~0%, zero Docker/Redis/Prometheus/Grafana).
+3. **Thẩm định & Đối chiếu:** Đưa ý kiến của ChatGPT vào bản thiết kế/implementation plan và nghiệm thu kết quả sau khi hoàn thành.
