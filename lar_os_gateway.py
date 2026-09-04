@@ -19,7 +19,9 @@ import re
 import uuid
 import hashlib
 import asyncio
+import socket
 import urllib.request
+import urllib.error
 import enum
 import random
 import contextlib
@@ -591,30 +593,109 @@ def is_account_healthy(account: str) -> bool:
     return True
 
 # ==========================================
-# 3.1. TINY PROCESS WATCHDOG (Phase 1)
+# 3.1. TINY PROCESS WATCHDOG (Phase 1 & Phase 8)
 # ==========================================
 CLIPROXY_EXE = SCRATCH / "cliproxyapi" / "cli-proxy-api.exe"
 CLIPROXY_CONFIG = SCRATCH / "cliproxyapi" / "config.yaml"
 
+class Tier4DeepHealth:
+    """
+    Phase 8: Two-Layer Deep Health Tracker for CLIProxyAPI & Google OAuth.
+    Zero-Quota Invariant:
+      - Layer 1 (Process/Socket): Handled by CLIProxyWatchdog (PID + TCP 18798).
+      - Layer 2 (Upstream OAuth):
+        * Passive: Every real request records 2xx -> OAuth usable, 401/403 -> OAuth suspect.
+        * Active probe: Rate-limited to max 1 probe every 60s, protected by asyncio.Lock (single-flight).
+    """
+    def __init__(self, check_url: str = "http://127.0.0.1:18798/v1/models"):
+        self.check_url = check_url
+        self.oauth_usable: Optional[bool] = None
+        self.last_probe_time: float = 0.0
+        self._lock = asyncio.Lock()
+
+    def record_result(self, status_code: int) -> None:
+        if 200 <= status_code < 300:
+            self.oauth_usable = True
+        elif status_code in (401, 403):
+            self.oauth_usable = False
+            log_event(f"⚠️ Tier-4 OAuth suspect: Received HTTP {status_code} from upstream proxy")
+
+    async def probe_if_needed(self, min_interval: float = 60.0) -> Optional[bool]:
+        now = time.monotonic()
+        if now - self.last_probe_time < min_interval:
+            return self.oauth_usable
+        async with self._lock:
+            if now - self.last_probe_time < min_interval:
+                return self.oauth_usable
+            self.last_probe_time = now
+
+            def _do_probe():
+                req = urllib.request.Request(
+                    self.check_url,
+                    headers={"Authorization": f"Bearer {CLIPROXY_KEY}"},
+                    method="GET"
+                )
+                try:
+                    with urllib.request.urlopen(req, timeout=2.5) as r:
+                        return r.status == 200
+                except urllib.error.HTTPError as he:
+                    if he.code in (401, 403):
+                        return False
+                    return False
+                except Exception:
+                    return False
+
+            try:
+                is_ok = await asyncio.to_thread(_do_probe)
+                if is_ok:
+                    self.oauth_usable = True
+                return self.oauth_usable
+            except Exception:
+                return self.oauth_usable
+
+    def snapshot(self) -> dict:
+        return {
+            "oauth_usable": self.oauth_usable,
+            "last_probe_time": round(self.last_probe_time, 1) if self.last_probe_time > 0 else None,
+            "status": "HEALTHY" if self.oauth_usable is True else ("OAUTH_SUSPECT" if self.oauth_usable is False else "UNKNOWN")
+        }
+
+tier4_deep_health = Tier4DeepHealth()
+
 class CLIProxyWatchdog:
     """
-    Owns and supervises cli-proxy-api.exe child process.
+    Owns and supervises cli-proxy-api.exe child process (Phase 1 & 8).
     Properties:
       - Fully asynchronous, zero blocking on FastAPI event loop
       - Periodic liveness polling every 10s
       - Auto-restart with Exponential Backoff (1s -> 2s -> 4s ... max 60s)
+      - L1 TCP port connectivity check via non-blocking connect_ex (0.15s timeout)
+      - Integrated Layer 1 + Layer 2 Deep Health tracking
       - Graceful shutdown on Gateway exit
       - Ultra-lightweight footprint (< 1MB RAM, ~0% CPU)
     """
-    def __init__(self, executable: Path, config: Path, interval: float = 10.0):
+    def __init__(self, executable: Path, config: Path, interval: float = 10.0, host: str = "127.0.0.1", port: int = 18798):
         self.executable = executable
         self.config = config
         self.interval = interval
+        self.host = host
+        self.port = port
         self._process: Optional[asyncio.subprocess.Process] = None
         self._task: Optional[asyncio.Task] = None
         self._stop_event = asyncio.Event()
         self._restart_delay = 1.0
         self._total_restarts = 0
+
+    def check_tcp_port(self) -> bool:
+        """Phase 8 L1 Process/Socket check: Non-blocking socket connect (0.15s timeout)."""
+        s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        s.settimeout(0.15)
+        try:
+            return s.connect_ex((self.host, self.port)) == 0
+        except Exception:
+            return False
+        finally:
+            s.close()
 
     async def start(self) -> None:
         if self._task is not None and not self._task.done():
@@ -715,12 +796,26 @@ class CLIProxyWatchdog:
 
     def status(self) -> dict:
         process = self._process
-        if process is None:
-            return {"running": False, "pid": None, "total_restarts": self._total_restarts, "restart_delay": self._restart_delay}
+        is_proc_alive = process is not None and process.returncode is None
+        tcp_open = self.check_tcp_port() if is_proc_alive else False
+        deep_stat = tier4_deep_health.snapshot()
+
+        if not is_proc_alive:
+            liveness_state = "DEAD"
+        elif not tcp_open:
+            liveness_state = "DEGRADED"
+        elif deep_stat["oauth_usable"] is False:
+            liveness_state = "OAUTH_SUSPECT"
+        else:
+            liveness_state = "HEALTHY"
+
         return {
-            "running": process.returncode is None,
-            "pid": process.pid,
-            "returncode": process.returncode,
+            "running": is_proc_alive,
+            "pid": process.pid if process else None,
+            "returncode": process.returncode if process else None,
+            "tcp_listening": tcp_open,
+            "deep_health": deep_stat,
+            "liveness_state": liveness_state,
             "total_restarts": self._total_restarts,
             "restart_delay": self._restart_delay
         }
@@ -831,19 +926,48 @@ def _call_cliproxy_sync(model: str, prompt: str, tools: Optional[List[Dict[str, 
         },
         method="POST"
     )
+    r = None
     try:
-        with urllib.request.urlopen(req, timeout=30) as r:
-            if r.status == 200:
-                resp_data = json.loads(r.read().decode("utf-8"))
-                choice = resp_data.get("choices", [{}])[0]
-                msg = choice.get("message", {})
-                return {
-                    "text": msg.get("content", ""),
-                    "tool_calls": msg.get("tool_calls") or []
-                }
+        r = urllib.request.urlopen(req, timeout=18)
+        tier4_deep_health.record_result(r.status)
+        if r.status == 200:
+            resp_data = json.loads(r.read().decode("utf-8"))
+            choice = resp_data.get("choices", [{}])[0]
+            msg = choice.get("message", {})
+            return {
+                "text": msg.get("content", ""),
+                "tool_calls": msg.get("tool_calls") or []
+            }
+    except urllib.error.HTTPError as he:
+        tier4_deep_health.record_result(he.code)
+        log_event(f"[-] CLIProxyAPI HTTP error ({he.code}): {he.reason}")
+        raise
     except Exception as e:
         log_event(f"[-] CLIProxyAPI call error ({ag_model}): {e}")
+        raise
+    finally:
+        if r is not None:
+            with contextlib.suppress(Exception):
+                r.close()
     return None
+
+# ==========================================
+# 6.2. PROCESS SELF-ISOLATION SUPERVISOR (Phase 9)
+# ==========================================
+async def _isolated_provider_call(call_coro, timeout_sec: float) -> tuple[Optional[Dict[str, Any]], Optional[Exception]]:
+    """
+    Phase 9: Self-Isolation Boundary Supervisor.
+    Isolates provider execution so that no timeout, socket error, or unexpected exception
+    can ever crash the router or pollute the asyncio event loop.
+    Guarantees strict monotonic bounding.
+    """
+    try:
+        res = await asyncio.wait_for(call_coro, timeout=timeout_sec)
+        return res, None
+    except asyncio.TimeoutError as te:
+        return None, te
+    except Exception as exc:
+        return None, exc
 
 # ==========================================
 # 7. CORE DISPATCHER ENGINE
@@ -894,23 +1018,36 @@ async def execute_model_request(model: str, messages: List[Dict[str, Any]], tool
 
     if "chatgpt" in model_lower or "opera" in model_lower:
         if consult_opera_neon:
-            res = await consult_opera_neon(engine="chatgpt", prompt=compacted_query)
-            ans_text = res.get("response") or res.get("message") or str(res)
-            return {"text": ans_text, "tool_calls": []}
+            res, exc = await _isolated_provider_call(
+                consult_opera_neon(engine="chatgpt", prompt=compacted_query),
+                timeout_sec=min(20.0, REQUEST_BUDGET_SEC)
+            )
+            if res:
+                ans_text = res.get("response") or res.get("message") or str(res)
+                return {"text": ans_text, "tool_calls": []}
+            log_event(f"[-] ChatGPT/Opera bridge error: {exc}")
 
     if "antigravity" in model_lower:
-        res = await asyncio.to_thread(_call_cliproxy_sync, model, compacted_query, tools)
+        res, exc = await _isolated_provider_call(
+            asyncio.to_thread(_call_cliproxy_sync, model, compacted_query, tools),
+            timeout_sec=min(20.0, REQUEST_BUDGET_SEC)
+        )
         if res and res.get("text"):
             log_event(f"✓ FULFILLED directly by Antigravity Free Tier ({model})")
             set_cached_response(p_hash, res)
             return res
+        log_event(f"[-] Direct Antigravity call failed: {exc}")
 
     if "claude" in model_lower:
         if consult_opera_neon:
-            res = await consult_opera_neon(engine="claude", prompt=compacted_query)
-            ans_text = res.get("response") or res.get("message") or str(res)
-            return {"text": ans_text, "tool_calls": []}
-
+            res, exc = await _isolated_provider_call(
+                consult_opera_neon(engine="claude", prompt=compacted_query),
+                timeout_sec=min(20.0, REQUEST_BUDGET_SEC)
+            )
+            if res:
+                ans_text = res.get("response") or res.get("message") or str(res)
+                return {"text": ans_text, "tool_calls": []}
+            log_event(f"[-] Claude/Opera bridge error: {exc}")
 
     # Core Gemini Multi-Account Pool
     keys_pool = []
@@ -965,7 +1102,9 @@ async def execute_model_request(model: str, messages: List[Dict[str, Any]], tool
             
         d = json.dumps(payload).encode("utf-8")
         req = urllib.request.Request(u, data=d, headers={"Content-Type": "application/json"}, method="POST")
-        with urllib.request.urlopen(req, timeout=12) as r:
+        r = None
+        try:
+            r = urllib.request.urlopen(req, timeout=5)
             if r.status == 200:
                 data = json.loads(r.read().decode("utf-8"))
                 cand = data.get("candidates", [{}])[0]
@@ -983,6 +1122,10 @@ async def execute_model_request(model: str, messages: List[Dict[str, Any]], tool
                             "args": fc.get("args", {})
                         })
                 return {"text": resp_text, "tool_calls": tool_calls}
+        finally:
+            if r is not None:
+                with contextlib.suppress(Exception):
+                    r.close()
         return None
 
     # Monotonic deadline budget & Decorrelated Jitter state (Phase 7)
@@ -1002,26 +1145,26 @@ async def execute_model_request(model: str, messages: List[Dict[str, Any]], tool
             cb = get_circuit(acc)
             hop_count += 1
             t_start = time.monotonic()
-            call_timeout = min(8.0, remaining)
-            try:
-                res_dict = await asyncio.wait_for(
-                    asyncio.to_thread(_do_request_sync, key_entry["key"], target_model, compacted_query, gemini_tools),
-                    timeout=call_timeout
+            call_timeout = min(4.5, remaining)
+            res_dict, call_exc = await _isolated_provider_call(
+                asyncio.to_thread(_do_request_sync, key_entry["key"], target_model, compacted_query, gemini_tools),
+                timeout_sec=call_timeout
+            )
+            elapsed_ms = (time.monotonic() - t_start) * 1000.0
+            if res_dict:
+                await cb.record_success(elapsed_ms)
+                curr_s = await cb.health_score()
+                log_event(f"✓ FULFILLED by {acc} ({target_model}) in {elapsed_ms:.0f}ms | Score: {curr_s:.1f} | EMA: {cb.latency_ema:.0f}ms | RTK: -{saved} chars")
+                set_cached_response(p_hash, res_dict)
+                telemetry_store.emit(
+                    kind=TelemetryKind.SUCCESS,
+                    provider=get_provider_code(acc),
+                    latency_ms=int(elapsed_ms),
+                    state=StateCode.CLOSED
                 )
-                elapsed_ms = (time.monotonic() - t_start) * 1000.0
-                if res_dict:
-                    await cb.record_success(elapsed_ms)
-                    curr_s = await cb.health_score()
-                    log_event(f"✓ FULFILLED by {acc} ({target_model}) in {elapsed_ms:.0f}ms | Score: {curr_s:.1f} | EMA: {cb.latency_ema:.0f}ms | RTK: -{saved} chars")
-                    set_cached_response(p_hash, res_dict)
-                    telemetry_store.emit(
-                        kind=TelemetryKind.SUCCESS,
-                        provider=get_provider_code(acc),
-                        latency_ms=int(elapsed_ms),
-                        state=StateCode.CLOSED
-                    )
-                    return res_dict
-            except Exception as e:
+                return res_dict
+            else:
+                e = call_exc or Exception("Empty response from upstream")
                 err_msg = str(e).lower()
                 is_429 = "429" in err_msg or "resource_exhausted" in err_msg
                 is_5xx = "500" in err_msg or "503" in err_msg or "502" in err_msg
@@ -1072,24 +1215,25 @@ async def execute_model_request(model: str, messages: List[Dict[str, Any]], tool
         log_event(f"🛡️ Activating TIER 4 FAILOVER (CLIProxyAPI Antigravity, budget remaining: {remaining_t4:.1f}s)...")
         telemetry_store.emit(kind=TelemetryKind.FAILOVER, provider=0, value=6)
         t4_start = time.monotonic()
-        try:
-            failover_res = await asyncio.wait_for(
-                asyncio.to_thread(_call_cliproxy_sync, target_model, compacted_query, tools),
-                timeout=min(20.0, remaining_t4)
+        t4_timeout = min(20.0, remaining_t4)
+        failover_res, failover_exc = await _isolated_provider_call(
+            asyncio.to_thread(_call_cliproxy_sync, target_model, compacted_query, tools),
+            timeout_sec=t4_timeout
+        )
+        t4_elapsed_ms = (time.monotonic() - t4_start) * 1000.0
+        if failover_res and failover_res.get("text"):
+            await t4_cb.record_success(t4_elapsed_ms)
+            log_event(f"✨ TIER 4 FULFILLED by Antigravity Free Proxy ({target_model}) in {t4_elapsed_ms:.0f}ms (EMA: {t4_cb.latency_ema:.0f}ms)!")
+            set_cached_response(p_hash, failover_res)
+            telemetry_store.emit(
+                kind=TelemetryKind.SUCCESS,
+                provider=6,
+                latency_ms=int(t4_elapsed_ms),
+                state=StateCode.CLOSED
             )
-            t4_elapsed_ms = (time.monotonic() - t4_start) * 1000.0
-            if failover_res and failover_res.get("text"):
-                await t4_cb.record_success(t4_elapsed_ms)
-                log_event(f"✨ TIER 4 FULFILLED by Antigravity Free Proxy ({target_model}) in {t4_elapsed_ms:.0f}ms (EMA: {t4_cb.latency_ema:.0f}ms)!")
-                set_cached_response(p_hash, failover_res)
-                telemetry_store.emit(
-                    kind=TelemetryKind.SUCCESS,
-                    provider=6,
-                    latency_ms=int(t4_elapsed_ms),
-                    state=StateCode.CLOSED
-                )
-                return failover_res
-        except Exception as e_failover:
+            return failover_res
+        else:
+            e_failover = failover_exc or Exception("Empty response from Tier-4 failover")
             err_msg = str(e_failover).lower()
             kind = FailureKind.HTTP_429 if "429" in err_msg else FailureKind.TIMEOUT
             await t4_cb.record_failure(kind)
@@ -1286,6 +1430,13 @@ function render(data){
       </tr>
     `;
   }).join('');
+
+  if(data.watchdog){
+    const wd = data.watchdog;
+    const liveness = wd.liveness_state || (wd.running ? 'RUNNING' : 'DEAD');
+    const oauth = wd.deep_health?.status || 'UNKNOWN';
+    $('sysStatus').textContent = `SYS: ONLINE | T4: ${liveness} (${oauth})`;
+  }
 }
 
 let timer = null;
@@ -1337,7 +1488,7 @@ async def health_check():
     telemetry_stat = telemetry_store.snapshot()
     return {
         "status": "ONLINE",
-        "service": "LAR-OS Unified AI Gateway v3.4 (Bounded Retry & Zero-Framework Dashboard)",
+        "service": "LAR-OS Unified AI Gateway v3.5 (Deep Health & Process Self-Isolation)",
         "architecture": "Supervised 4-Tier Heterogeneous Redundancy + 3-State Circuit Breakers + SQLite WAL Telemetry",
         "uptime_seconds": int(time.time() - STATS["start_time"]),
         "total_requests": STATS["total_requests"],
@@ -1361,7 +1512,7 @@ async def gateway_status():
     recent_events = telemetry_store.get_recent_events(limit=20)
     return {
         "status": "ONLINE",
-        "service": "LAR-OS Unified AI Gateway v3.4",
+        "service": "LAR-OS Unified AI Gateway v3.5 (Deep Health & Process Self-Isolation)",
         "uptime_seconds": int(time.time() - STATS["start_time"]),
         "total_requests": STATS["total_requests"],
         "cache_hits": STATS["cache_hits"],
