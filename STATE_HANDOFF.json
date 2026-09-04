@@ -1,14 +1,14 @@
 {
   "header": {
     "algorithm": "HMAC-SHA256",
-    "signature": "b7f5446237de7dde0f42b600672e8b8d9d2950723d63aa85e96e6d5a2705022c",
-    "created_at": "2026-09-03T17:44:41.823762+00:00"
+    "signature": "fa0cad12938a12466e9d794b15053730cafe0bad9f2770577a64f1b0c69d892a",
+    "created_at": "2026-09-04T02:02:49.323281+00:00"
   },
   "payload": {
     "protocol_version": "AHCP-V1.0",
-    "timestamp": "2026-09-03T17:44:41.823762+00:00",
-    "source_instance": "AGY-ORCHESTRATOR-TQ228",
-    "reason": "Official Handover: Transition from thuaquan228 to incoming Antigravity instance",
+    "timestamp": "2026-09-04T02:02:49.323281+00:00",
+    "source_instance": "TEST-INSTANCE-01",
+    "reason": "Unit test execution",
     "system_status": {
       "gateway_port": 18797,
       "gateway_host": "127.0.0.1",

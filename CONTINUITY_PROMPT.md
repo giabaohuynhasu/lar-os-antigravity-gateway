@@ -1,9 +1,9 @@
 # ANTIGRAVITY SESSION RESUMPTION INSTRUCTION
 ## Universal Antigravity Continuity Protocol (AHCP-V1)
 
-**Source Instance:** `AGY-ORCHESTRATOR-TQ228`  
-**Handover Timestamp:** `2026-09-03T17:44:41.823762+00:00`  
-**Cryptographic Signature:** `b7f5446237de7dde...e96e6d5a2705022c`  
+**Source Instance:** `TEST-INSTANCE-01`  
+**Handover Timestamp:** `2026-09-04T02:02:49.323281+00:00`  
+**Cryptographic Signature:** `fa0cad12938a1246...7a64f1b0c69d892a`  
 **Status:** Cryptographically Verified Handover Chain  
 
 ---
@@ -35,7 +35,7 @@ You are continuing directly from the previous Antigravity session without any lo
 - **Anti-Crash Protocol (ACP-V1):** Strict memory limits, bounded caches, zero file-locks, safe timeout.
 - **War Correspondent Discipline:** Anchor all claims to date, institution, and verifiable source.
 - **Zero Fabrication:** Never fabricate DOIs, citations, or tool states.
-- **Signature Logging:** On your first response, sign your message with your new instance identifier (e.g. `AGY-ORCHESTRATOR-BH051 [RESUMED: 2026-09-03T17:44:41.823762+00:00]`).
+- **Signature Logging:** On your first response, sign your message with your new instance identifier (e.g. `AGY-ORCHESTRATOR-BH051 [RESUMED: 2026-09-04T02:02:49.323281+00:00]`).
 
 ### INCOMING ACTION
 Acknowledge receipt of this handover, verify state integrity, and report readiness for the next user directive.

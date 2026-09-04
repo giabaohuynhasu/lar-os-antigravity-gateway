@@ -54,9 +54,10 @@ except Exception:
     query_perplexity_comet = None
 
 try:
-    from opera_chatgpt_operator import operate_chatgpt_on_opera
+    from opera_neon_ai_bridge import OperaNeonBridge, consult_opera_neon
 except Exception:
-    operate_chatgpt_on_opera = None
+    OperaNeonBridge = None
+    consult_opera_neon = None
 
 try:
     from edge_copilot_bridge import query_edge_copilot
@@ -553,6 +554,26 @@ MCP_TOOLS_DEFINITIONS = [
             },
             "required": ["agent_id", "prompt"]
         }
+    },
+    {
+        "name": "opera_neon_consult",
+        "description": "Zero-quota AI consultation with top frontier models (ChatGPT GPT-5.6/o1, DeepSeek-R1, Moonshot Kimi) running in Opera Neon on port 9224 with authentic user sessions.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "engine": {
+                    "type": "string",
+                    "enum": ["chatgpt", "deepseek", "kimi"],
+                    "default": "chatgpt",
+                    "description": "Frontier AI engine to query inside Opera Neon."
+                },
+                "prompt": {
+                    "type": "string",
+                    "description": "Prompt or query to submit to the chosen model."
+                }
+            },
+            "required": ["prompt"]
+        }
     }
 ]
 
@@ -613,6 +634,14 @@ async def handle_mcp_jsonrpc(body: Dict[str, Any]) -> Dict[str, Any]:
                     result_text = res.get("response", str(res))
                 else:
                     result_text = "Comet Perplexity bridge not initialized."
+            elif tool_name == "opera_neon_consult":
+                if consult_opera_neon:
+                    eng = args.get("engine", "chatgpt")
+                    p = args.get("prompt", "")
+                    res = await consult_opera_neon(engine=eng, prompt=p)
+                    result_text = res.get("response") or res.get("message") or str(res)
+                else:
+                    result_text = "Opera Neon AI bridge not initialized."
             elif tool_name == "third_order_audit":
                 try:
                     from sandbox import audit_record, ConfidenceLevel
@@ -740,6 +769,39 @@ async def call_m365_subagent_api(agent_id: str, request: Request):
         return JSONResponse(res)
     else:
         raise HTTPException(status_code=503, detail="M365 Sub-Agent engine offline")
+
+# 8d. OPERA NEON AI REST ENDPOINTS
+@app.get("/neon/status")
+async def get_neon_status_api():
+    """Returns Opera Neon connection status and tab telemetry."""
+    if OperaNeonBridge:
+        bridge = OperaNeonBridge()
+        alive = bridge.is_alive()
+        tabs = bridge.list_tabs() if alive else []
+        return {
+            "status": "connected" if alive else "disconnected",
+            "alive": alive,
+            "cdp_port": 9224,
+            "tab_count": len(tabs),
+            "tabs": [{"title": t.get("title"), "url": t.get("url")} for t in tabs[:10]]
+        }
+    return {"status": "error", "alive": False, "message": "OperaNeonBridge module offline"}
+
+@app.post("/neon/consult")
+async def call_neon_consult_api(request: Request):
+    """Executes a zero-token AI consultation via Opera Neon (ChatGPT, DeepSeek, Kimi)."""
+    try:
+        body = await request.json()
+    except Exception:
+        raise HTTPException(status_code=400, detail="Invalid JSON body")
+    prompt = body.get("prompt", "")
+    engine = body.get("engine", "chatgpt")
+    if not prompt:
+        raise HTTPException(status_code=400, detail="Field 'prompt' is required")
+    if consult_opera_neon:
+        res = await consult_opera_neon(engine=engine, prompt=prompt)
+        return JSONResponse(res)
+    raise HTTPException(status_code=503, detail="Opera Neon AI bridge offline")
 
 # ==========================================
 # 9. EMBEDDED WEB DASHBOARD

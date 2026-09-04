@@ -54,6 +54,12 @@ It serves as the runtime backbone for **LAR-OS (Longevity & Asymmetry Research O
 - High-aesthetic dark-mode interface with Glassmorphism styling.
 - Live telemetry: Request counters, cache hit rates, RTK character savings, and real-time Google AI Pro account status.
 
+### 6. Opera Neon Browser Substrate & Zero-Quota Frontier AI Harvesting
+- Native integration with Opera Neon AI Browser substrate running on persistent CDP port `9224`.
+- Employs **Token Compression (TOON / AXI)** reducing page DOM overhead by up to 80%.
+- Harnesses user's real, logged-in sessions across **ChatGPT** (GPT-5.6 / o1 / Canvas), **DeepSeek** (DeepSeek-R1 / V3), and **Moonshot Kimi** (Kimi K3) with **zero API costs and zero token consumption**.
+- Supports human fallback via Chrome Remote Desktop when CAPTCHA / 2FA verification is required.
+
 ---
 
 ## 🏛️ Account & Role Matrix
