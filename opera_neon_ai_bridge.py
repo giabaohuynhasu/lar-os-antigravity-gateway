@@ -29,6 +29,15 @@ AI_TARGETS = {
         "stop_selector": "button[aria-label*='Dừng'], button[aria-label*='Stop'], button[data-testid='stop-button']",
         "response_selector": "article, div[data-message-author-role='assistant'], div.agent-turn, div.markdown"
     },
+    "claude": {
+        "name": "Claude Sonnet (Anthropic)",
+        "url": "https://claude.ai/new",
+        "login_url": "https://claude.ai/login",
+        "input_selector": "div[contenteditable='true'], fieldset [contenteditable='true'], .ProseMirror",
+        "send_selector": "button[aria-label*='Envoyer'], button[aria-label*='Send'], button[aria-label*='send']",
+        "stop_selector": "[data-is-streaming='true'], button[aria-label*='Stop'], button[aria-label*='Arrêter']",
+        "response_selector": ".font-claude-message, .standard-markdown, div[data-test-render-count]"
+    },
     "deepseek": {
         "name": "DeepSeek-R1 / V3",
         "url": "https://chat.deepseek.com/",
@@ -145,6 +154,7 @@ class OperaNeonBridge:
             var isAuthPage = url.includes('/auth') || url.includes('/login') || url.includes('sign_in');
             var buttons = Array.from(document.querySelectorAll('button, a')).map(b => b.innerText.trim()).filter(Boolean);
             var hasGoogleBtn = buttons.some(b => b.toLowerCase().includes('google') || b.toLowerCase().includes('tiếp tục với google'));
+            var hasRateLimit = bodyText.includes('limite de messages') || bodyText.includes('rate limit') || bodyText.includes('Passez à un forfait');
             
             return JSON.stringify({{
                 engine: "{engine}",
@@ -154,6 +164,7 @@ class OperaNeonBridge:
                 has_input_area: Boolean(inputEl),
                 is_auth_page: isAuthPage,
                 has_google_login_btn: hasGoogleBtn,
+                has_rate_limit: hasRateLimit,
                 button_sample: buttons.slice(0, 8),
                 snippet: bodyText.slice(0, 300)
             }});
@@ -187,6 +198,14 @@ class OperaNeonBridge:
                 "reason": "Cloudflare Turnstile verification detected.",
                 "action": "Please complete the verification in Opera Neon or via Chrome Remote Desktop."
             }
+        if status.get("has_rate_limit") and engine == "claude":
+            return {
+                "status": "RATE_LIMITED",
+                "engine": engine,
+                "reason": "Claude message limit reached for current 5h window in Opera Neon.",
+                "reset_time": "14:00",
+                "action": "Message limit resets at 14:00 (local time) or upgrade to Pro."
+            }
             
         # Navigate if not on target URL
         if domain not in tab.get("url", ""):
@@ -199,7 +218,7 @@ class OperaNeonBridge:
         (async function() {{
             function findChatInput() {{
                 // Strictly exclude elements inside past articles (editing previous messages) or Canvas surfaces
-                var candidates = Array.from(document.querySelectorAll('#prompt-textarea, form [contenteditable="true"], footer [contenteditable="true"], div[contenteditable="true"], textarea'));
+                var candidates = Array.from(document.querySelectorAll('#prompt-textarea, form [contenteditable="true"], footer [contenteditable="true"], div[contenteditable="true"], fieldset [contenteditable="true"], .ProseMirror, textarea'));
                 var filtered = candidates.filter(function(el) {{
                     return !el.closest('article') && !el.closest('[data-testid*="canvas"]') && !el.closest('.canvas-container') && !el.closest('.writing-surface');
                 }});
@@ -240,11 +259,12 @@ class OperaNeonBridge:
             // Poll for send button inside composer container to become enabled
             for (var i = 0; i < 15; i++) {{
                 await new Promise(r => setTimeout(r, 100));
-                var container = input.closest('form, #composer-background, footer, [data-testid="composer"]') || document;
+                var container = input.closest('fieldset, form, #composer-background, footer, [data-testid="composer"]') || document;
                 var sendBtn = container.querySelector('#composer-submit-button') || 
                               container.querySelector('button[data-testid="send-button"]') || 
                               container.querySelector('button[aria-label*="Gửi"]') ||
                               container.querySelector('button[aria-label*="Send"]') ||
+                              container.querySelector('button[aria-label*="Envoyer"]') ||
                               document.querySelector("{cfg['send_selector']}");
                 if (sendBtn && !sendBtn.disabled && sendBtn.getAttribute('aria-disabled') !== 'true') {{
                     sendBtn.click();

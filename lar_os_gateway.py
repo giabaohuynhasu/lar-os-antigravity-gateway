@@ -557,13 +557,13 @@ MCP_TOOLS_DEFINITIONS = [
     },
     {
         "name": "opera_neon_consult",
-        "description": "Zero-quota AI consultation with top frontier models (ChatGPT GPT-5.6/o1, DeepSeek-R1, Moonshot Kimi) running in Opera Neon on port 9224 with authentic user sessions.",
+        "description": "Zero-quota AI consultation with top frontier models (ChatGPT GPT-5.6/o1, Claude Sonnet 5, DeepSeek-R1, Moonshot Kimi) running in Opera Neon on port 9224 with authentic user sessions.",
         "inputSchema": {
             "type": "object",
             "properties": {
                 "engine": {
                     "type": "string",
-                    "enum": ["chatgpt", "deepseek", "kimi"],
+                    "enum": ["chatgpt", "claude", "deepseek", "kimi"],
                     "default": "chatgpt",
                     "description": "Frontier AI engine to query inside Opera Neon."
                 },

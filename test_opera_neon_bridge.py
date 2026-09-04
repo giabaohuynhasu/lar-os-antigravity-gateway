@@ -10,7 +10,7 @@ import sys
 from pathlib import Path
 
 # Ensure paths
-GATEWAY_DIR = Path(__file__).resolve().parent.parent
+GATEWAY_DIR = Path(__file__).resolve().parent
 sys.path.insert(0, str(GATEWAY_DIR))
 
 from opera_neon_ai_bridge import OperaNeonBridge, AI_TARGETS, consult_opera_neon
@@ -22,6 +22,7 @@ class TestOperaNeonBridge(unittest.TestCase):
 
     def test_targets_configuration(self):
         self.assertIn("chatgpt", AI_TARGETS)
+        self.assertIn("claude", AI_TARGETS)
         self.assertIn("deepseek", AI_TARGETS)
         self.assertIn("kimi", AI_TARGETS)
         for engine, cfg in AI_TARGETS.items():
@@ -39,8 +40,15 @@ class TestOperaNeonBridge(unittest.TestCase):
         tabs = self.bridge.list_tabs()
         self.assertIsInstance(tabs, list)
         self.assertGreater(len(tabs), 0, "Opera Neon should have at least 1 tab open")
-        titles = [t.get("title", "") for t in tabs]
         self.assertTrue(any("chatgpt" in t.get("url", "").lower() for t in tabs), "ChatGPT tab should exist in Opera Neon")
+        self.assertTrue(any("claude.ai" in t.get("url", "").lower() for t in tabs), "Claude tab should exist in Opera Neon")
+
+    def test_inspect_claude_status(self):
+        status = asyncio.run(self.bridge.inspect_target_status("claude"))
+        self.assertIsInstance(status, dict)
+        self.assertEqual(status.get("engine"), "claude")
+        self.assertIn("title", status)
+        self.assertIn("has_rate_limit", status)
 
     def test_inspect_kimi_status(self):
         status = asyncio.run(self.bridge.inspect_target_status("kimi"))
@@ -56,7 +64,7 @@ class TestOperaNeonBridge(unittest.TestCase):
         props = neon_tool["inputSchema"]["properties"]
         self.assertIn("engine", props)
         self.assertIn("prompt", props)
-        self.assertEqual(props["engine"]["enum"], ["chatgpt", "deepseek", "kimi"])
+        self.assertEqual(props["engine"]["enum"], ["chatgpt", "claude", "deepseek", "kimi"])
 
     def test_mcp_jsonrpc_tools_list(self):
         req = {"id": "test-1", "method": "tools/list", "params": {}}
