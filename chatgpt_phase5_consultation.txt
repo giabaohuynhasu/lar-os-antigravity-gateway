@@ -1,0 +1,651 @@
+Đã rõ. Với trạng thái hiện tại của LAR-OS, mình sẽ thiết kế Phase 5–6 theo nguyên tắc telemetry là hệ thống phụ trợ hoàn toàn: nếu SQLite chết, chậm, đầy disk hoặc worker crash thì request path vẫn chạy bình thường.
+
+Điểm quan trọng nhất: không dùng asyncio.to_thread() cho từng event. Một writer thread duy nhất + queue.Queue là hợp lý hơn: Gateway chỉ enqueue một object nhỏ rồi trả lại event loop; thread SQLite ngủ trên queue.get() nên CPU idle gần như bằng 0. SQLite WAL cho phép reader và writer hoạt động đồng thời, dù vẫn chỉ có một writer tại một thời điểm. 
+SQLite
+
+Kiến trúc mình chốt cho Phase 5–6
+Gateway request
+     │
+     ├── routing / circuit / EMA
+     │
+     └── telemetry.emit(...)
+              │
+              ▼
+       bounded queue.Queue
+              │
+              │  blocking get()
+              ▼
+       SQLite Writer Thread
+              │
+              ├── batch INSERT
+              ├── periodic-by-event-count prune
+              └── PASSIVE checkpoint
+              │
+              ▼
+       telemetry.db
+          ├── telemetry_events
+          ├── -wal
+          └── -shm
+
+Không có polling loop. Không có Prometheus. Không có Redis. Không có background CPU loop.
+
+1. Schema tối giản
+
+Mình sẽ không lưu JSON blob cho mỗi request. Nó vừa tốn disk vừa làm query /status vô ích.
+
+SQL
+CREATE TABLE IF NOT EXISTS telemetry_events (
+    id INTEGER PRIMARY KEY,
+    ts INTEGER NOT NULL,
+    kind INTEGER NOT NULL,
+    provider INTEGER NOT NULL,
+    latency_ms INTEGER,
+    state INTEGER,
+    value INTEGER
+);
+
+CREATE INDEX IF NOT EXISTS idx_telemetry_ts
+ON telemetry_events(ts);
+
+Trong đó dùng integer codes:
+
+kind:
+1 = REQUEST
+2 = SUCCESS
+3 = FAILURE
+4 = STATE_TRANSITION
+5 = FAILOVER
+6 = WATCHDOG
+7 = PRUNE
+
+provider:
+0 = none
+1..5 = Gemini Pro accounts
+6 = tier4_cliproxyapi
+
+state:
+0 = CLOSED
+1 = OPEN
+2 = HALF_OPEN
+
+Ví dụ:
+
+REQUEST       → (ts, 1, provider, NULL, state, NULL)
+SUCCESS       → (ts, 2, provider, 1120, state, NULL)
+FAILURE       → (ts, 3, provider, 850, state, error_code)
+FAILOVER      → (ts, 5, old_provider, NULL, NULL, new_provider)
+
+ts nên là Unix milliseconds hoặc seconds. Với audit telemetry, milliseconds hợp lý hơn:
+
+Python
+Chạy
+time.time_ns() // 1_000_000
+
+Còn latency vẫn phải đo bằng:
+
+Python
+Chạy
+time.monotonic_ns()
+
+đúng như Phase 3–4 của bạn.
+
+2. PRAGMA configuration
+
+Mình đề xuất:
+
+SQL
+PRAGMA journal_mode=WAL;
+PRAGMA synchronous=NORMAL;
+PRAGMA temp_store=MEMORY;
+PRAGMA cache_size=-256;
+PRAGMA wal_autocheckpoint=256;
+PRAGMA journal_size_limit=1048576;
+PRAGMA busy_timeout=100;
+Vì sao?
+
+WAL
+
+Đây là lựa chọn đúng cho workload của LAR-OS: nhiều read /status, ít writer, một writer thread. SQLite xác nhận WAL cho phép reader chạy đồng thời với writer. 
+SQLite
+
+synchronous=NORMAL
+
+Đây là điểm mình đặc biệt khuyến nghị.
+
+Trong WAL + NORMAL, sync chủ yếu được đẩy vào checkpoint thay vì mỗi transaction commit; SQLite cũng ghi rõ rằng nếu checkpoint được thực hiện ở thread/process riêng thì main thread không phải chờ sync I/O. Đổi lại, telemetry có thể mất một lượng event gần đây nếu máy mất điện/crash cứng. Với telemetry thì trade-off này cực kỳ hợp lý. 
+SQLite
+
+temp_store=MEMORY
+
+Telemetry query nhỏ, không cần temp files.
+
+cache_size=-256
+
+SQLite hiểu số âm là kích thước cache tính theo KiB → khoảng 256 KiB page cache. Không cần cho telemetry một cache lớn.
+
+wal_autocheckpoint=256
+
+Đừng để default 1000 pages nếu mục tiêu của bạn là giữ WAL nhỏ. SQLite mặc định checkpoint ở 1000 pages; với page 4 KiB, đó có thể khoảng 4 MB WAL trước checkpoint. 
+SQLite
++1
+
+256 pages ≈ 1 MB.
+
+journal_size_limit=1048576
+
+Giữ WAL/journal residual ở khoảng 1 MB sau checkpoint. SQLite hỗ trợ trực tiếp cơ chế này. 
+SQLite
+
+3. Writer: queue.Queue + một thread
+
+Đây là phần mình đánh giá quan trọng nhất.
+
+Python
+Chạy
+import queue
+import sqlite3
+import threading
+import time
+from dataclasses import dataclass
+
+
+TELEMETRY_MAX_QUEUE = 2048
+TELEMETRY_BATCH_SIZE = 64
+
+
+@dataclass(slots=True)
+class TelemetryEvent:
+    ts: int
+    kind: int
+    provider: int
+    latency_ms: int | None = None
+    state: int | None = None
+    value: int | None = None
+
+
+class TelemetryStore:
+
+    def __init__(self, db_path: str):
+        self.db_path = db_path
+
+        self.queue = queue.Queue(maxsize=TELEMETRY_MAX_QUEUE)
+
+        self._stop = threading.Event()
+        self._thread = threading.Thread(
+            target=self._writer_loop,
+            name="laros-telemetry",
+            daemon=True,
+        )
+
+        self.dropped_events = 0
+        self._insert_count = 0
+
+    def start(self):
+        self._thread.start()
+
+    def emit(
+        self,
+        kind: int,
+        provider: int = 0,
+        latency_ms: int | None = None,
+        state: int | None = None,
+        value: int | None = None,
+    ):
+        event = TelemetryEvent(
+            ts=time.time_ns() // 1_000_000,
+            kind=kind,
+            provider=provider,
+            latency_ms=latency_ms,
+            state=state,
+            value=value,
+        )
+
+        try:
+            self.queue.put_nowait(event)
+        except queue.Full:
+            # Telemetry MUST NEVER block the request path.
+            self.dropped_events += 1
+
+    def stop(self):
+        self._stop.set()
+
+        # Give writer a chance to flush.
+        self._thread.join(timeout=2.0)
+
+    def _open(self):
+        conn = sqlite3.connect(
+            self.db_path,
+            timeout=0.1,
+            isolation_level=None,
+        )
+
+        conn.execute("PRAGMA journal_mode=WAL")
+        conn.execute("PRAGMA synchronous=NORMAL")
+        conn.execute("PRAGMA temp_store=MEMORY")
+        conn.execute("PRAGMA cache_size=-256")
+        conn.execute("PRAGMA wal_autocheckpoint=256")
+        conn.execute("PRAGMA journal_size_limit=1048576")
+        conn.execute("PRAGMA busy_timeout=100")
+
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS telemetry_events (
+                id INTEGER PRIMARY KEY,
+                ts INTEGER NOT NULL,
+                kind INTEGER NOT NULL,
+                provider INTEGER NOT NULL,
+                latency_ms INTEGER,
+                state INTEGER,
+                value INTEGER
+            )
+        """)
+
+        conn.execute("""
+            CREATE INDEX IF NOT EXISTS idx_telemetry_ts
+            ON telemetry_events(ts)
+        """)
+
+        return conn
+
+    def _writer_loop(self):
+
+        conn = None
+
+        try:
+            conn = self._open()
+
+            while True:
+
+                # Event-driven blocking wait.
+                try:
+                    first = self.queue.get(
+                        timeout=0.5
+                    )
+                except queue.Empty:
+
+                    if self._stop.is_set():
+                        break
+
+                    continue
+
+                batch = [first]
+
+                # Drain already-available events without waiting.
+                while len(batch) < TELEMETRY_BATCH_SIZE:
+
+                    try:
+                        batch.append(
+                            self.queue.get_nowait()
+                        )
+                    except queue.Empty:
+                        break
+
+                self._write_batch(conn, batch)
+
+                for _ in batch:
+                    self.queue.task_done()
+
+        except Exception:
+            # Telemetry failure must never crash Gateway.
+            pass
+
+        finally:
+            if conn is not None:
+                try:
+                    conn.execute(
+                        "PRAGMA wal_checkpoint(PASSIVE)"
+                    )
+                except Exception:
+                    pass
+
+                try:
+                    conn.close()
+                except Exception:
+                    pass
+
+    def _write_batch(self, conn, batch):
+
+        conn.execute("BEGIN")
+
+        try:
+            conn.executemany(
+                """
+                INSERT INTO telemetry_events
+                (ts, kind, provider, latency_ms, state, value)
+                VALUES (?, ?, ?, ?, ?, ?)
+                """,
+                [
+                    (
+                        e.ts,
+                        e.kind,
+                        e.provider,
+                        e.latency_ms,
+                        e.state,
+                        e.value,
+                    )
+                    for e in batch
+                ],
+            )
+
+            conn.execute("COMMIT")
+
+        except Exception:
+            conn.execute("ROLLBACK")
+            return
+
+        self._insert_count += len(batch)
+
+        # Maintenance is event-driven, not timer-driven.
+        if self._insert_count >= 512:
+            self._insert_count = 0
+            self._maintenance(conn)
+Một điểm rất quan trọng
+
+queue.Full → drop telemetry, không được block request.
+
+Tức là nếu SQLite bị treo 10 giây:
+
+Gateway       vẫn chạy
+API requests  vẫn chạy
+Router        vẫn chạy
+Circuit       vẫn chạy
+EMA           vẫn chạy
+
+Telemetry     có thể mất event
+
+Đây chính xác là failure domain mà mình muốn.
+
+4. Rolling prune
+
+Mình sẽ dùng hai giới hạn cùng lúc:
+
+MAX_ROWS = 50,000
+MAX_DB_BYTES ≈ 2 MB
+
+Nhưng đừng VACUUM mỗi lần vượt giới hạn.
+
+Đó sẽ là một thảm họa về I/O.
+
+Thay vào đó:
+
+Python
+Chạy
+MAX_TELEMETRY_ROWS = 50_000
+TARGET_TELEMETRY_ROWS = 45_000
+
+MAX_DB_BYTES = 2 * 1024 * 1024
+
+Maintenance:
+
+Python
+Chạy
+def _maintenance(self, conn):
+
+    try:
+        row = conn.execute(
+            "SELECT COUNT(*) FROM telemetry_events"
+        ).fetchone()
+
+        count = row[0]
+
+        if count > MAX_TELEMETRY_ROWS:
+
+            delete_n = count - TARGET_TELEMETRY_ROWS
+
+            conn.execute(
+                """
+                DELETE FROM telemetry_events
+                WHERE id IN (
+                    SELECT id
+                    FROM telemetry_events
+                    ORDER BY id
+                    LIMIT ?
+                )
+                """,
+                (delete_n,),
+            )
+
+    except Exception:
+        return
+
+Nhưng còn một vấn đề: 50.000 rows không đảm bảo DB <2 MB.
+
+Vì vậy, nếu hard cap 2 MB thực sự là invariant, nên kiểm tra physical size chỉ mỗi 512 events, không phải mỗi request:
+
+Python
+Chạy
+import os
+
+
+def _database_size_ok(self):
+
+    try:
+        size = os.path.getsize(self.db_path)
+        wal = os.path.getsize(self.db_path + "-wal")
+
+        return (size + wal) <= MAX_DB_BYTES
+
+    except OSError:
+        return True
+
+Nếu vượt:
+
+Python
+Chạy
+def _maintenance(self, conn):
+
+    try:
+        count = conn.execute(
+            "SELECT COUNT(*) FROM telemetry_events"
+        ).fetchone()[0]
+
+        oversized = not self._database_size_ok()
+
+        if count > MAX_TELEMETRY_ROWS or oversized:
+
+            target = 40_000 if oversized else 45_000
+
+            conn.execute(
+                """
+                DELETE FROM telemetry_events
+                WHERE id IN (
+                    SELECT id
+                    FROM telemetry_events
+                    ORDER BY id
+                    LIMIT MAX(
+                        0,
+                        (SELECT COUNT(*) FROM telemetry_events) - ?
+                    )
+                )
+                """,
+                (target,),
+            )
+
+            conn.execute(
+                "PRAGMA wal_checkpoint(PASSIVE)"
+            )
+
+    except Exception:
+        pass
+VACUUM thì sao?
+
+Không chạy thường xuyên.
+
+DELETE sẽ giải phóng các page cho SQLite tái sử dụng, nhưng không nhất thiết làm file vật lý nhỏ ngay lập tức.
+
+Nếu bạn muốn hard physical cap thì có thể có một maintenance event hiếm:
+
+DB > 2 MB
+      ↓
+prune
+      ↓
+PASSIVE checkpoint
+      ↓
+vẫn > 2 MB?
+      ↓
+maintenance window
+      ↓
+VACUUM
+
+Nhưng VACUUM có thể tạo I/O spike. Với LAR-OS, mình sẽ không đưa VACUUM vào request lifecycle. Nó chỉ thuộc Phase 6 maintenance.
+
+5. Event-driven Maintenance
+
+Đây mới là chỗ Phase 6 nên khác một daemon monitoring bình thường.
+
+Không:
+
+Python
+Chạy
+while True:
+    await asyncio.sleep(60)
+    check_database()
+
+Mà:
+
+request event
+     ↓
+telemetry queue
+     ↓
+writer
+     ↓
+every 512 events
+     ↓
+maintenance
+
+Do đó khi Gateway không có traffic:
+
+CPU ≈ 0
+SQLite ≈ 0
+maintenance ≈ 0
+
+Writer đang ở:
+
+Python
+Chạy
+queue.get()
+
+nên thread thực sự ngủ, không busy-loop.
+
+6. /status cực nhẹ
+
+Không cần dashboard database riêng.
+
+Ví dụ:
+
+Python
+Chạy
+def get_status(self):
+
+    conn = sqlite3.connect(
+        self.db_path,
+        timeout=0.1,
+    )
+
+    try:
+        total = conn.execute(
+            "SELECT COUNT(*) FROM telemetry_events"
+        ).fetchone()[0]
+
+        last_event = conn.execute(
+            """
+            SELECT ts, kind, provider,
+                   latency_ms, state, value
+            FROM telemetry_events
+            ORDER BY id DESC
+            LIMIT 1
+            """
+        ).fetchone()
+
+        return {
+            "events": total,
+            "last_event": last_event,
+            "queue_depth": self.queue.qsize(),
+            "dropped_events": self.dropped_events,
+        }
+
+    finally:
+        conn.close()
+
+WAL cho phép reader hoạt động song song với writer. 
+SQLite
+
+7. Tôi sẽ thêm một invariant rất quan trọng
+Telemetry phải là best-effort, never-authoritative.
+
+Tức là:
+
+                  ┌── Circuit Breaker
+                  │
+Request ─ Router ─┼── Health Score
+                  │
+                  ├── Latency EMA
+                  │
+                  └── Telemetry ──► SQLite
+                                      │
+                                      X
+                              nếu SQLite chết
+                                      │
+                              request vẫn chạy
+
+Không bao giờ làm:
+
+Python
+Chạy
+await telemetry.write(...)
+
+trước khi trả response.
+
+Thay vào đó:
+
+Python
+Chạy
+telemetry.emit(...)
+
+và kết thúc.
+
+8. Phase 5 + 6 sau khi hoàn thành sẽ có profile như này
+Component	RAM	CPU idle	Blocking request
+EMA	vài KB	~0	Không
+Health score	vài KB	~0	Không
+queue.Queue	bounded	~0	Không
+SQLite connection	nhỏ	~0	Không
+Writer thread	nhỏ	~0	Không
+WAL	disk	0	Không
+Prune	event-triggered	~0	Không
+/status	nhỏ	~0	Không
+
+Phần telemetry bổ sung thực tế sẽ rất nhỏ so với mục tiêu RAM 45 MB của toàn Gateway. Mình sẽ xem <45 MB là invariant cho toàn process, còn <2 MB nên hiểu là mục tiêu cho telemetry state + queue + SQLite runtime overhead, vì bản thân Python interpreter/FastAPI/uvicorn đã chiếm nhiều hơn 2 MB.
+
+Một điều mình muốn chỉnh ngay từ thiết kế của bạn
+
+Với yêu cầu “<2 MB”, đừng đặt:
+
+SQL
+wal_autocheckpoint=1000
+
+theo default.
+
+SQLite mặc định checkpoint ở 1000 pages, và với page 4 KiB có thể để WAL lên khoảng 4 MB trước checkpoint. 
+SQLite
++1
+
+Mình chọn:
+
+WAL                    ON
+synchronous            NORMAL
+wal_autocheckpoint     256 pages
+journal_size_limit     1 MB
+cache_size             256 KB
+temp_store             MEMORY
+busy_timeout           100 ms
+writer                 1 daemon thread
+queue                  2048 events
+batch                  64 events
+maintenance             mỗi 512 events
+
+Đây là cấu hình khá “đúng chất LAR-OS”: không có daemon làm việc vô ích, không có polling, không có dependency, không để disk I/O chạm vào critical path.
+
+Và quan trọng nhất: Phase 5–6 này không cần phá kiến trúc Phase 1–4. Nó chỉ nằm bên cạnh request pipeline, ghi lại những gì pipeline đã làm. SQLite WAL bản thân cũng được thiết kế để reader không phải chặn writer trong workload kiểu này. 
+SQLite
+
+Nếu Antigravity gửi lar_os_gateway.py hiện tại, mình có thể map chính xác Phase 5–6 vào các class Phase 2–4 đang tồn tại, đặc biệt là để không tạo một CircuitBreaker/health state thứ hai và giữ nguyên các invariant deadlock/failover hiện tại.

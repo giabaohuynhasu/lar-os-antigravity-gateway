@@ -26,3 +26,4 @@ cliproxyapi/
 *.png
 *.jpg
 *.log
+*.db*

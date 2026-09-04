@@ -24,6 +24,9 @@ import enum
 import random
 import contextlib
 import subprocess
+import queue
+import sqlite3
+import threading
 from dataclasses import dataclass, field
 from typing import Optional, List, Dict, Any, AsyncGenerator
 from pathlib import Path
@@ -120,6 +123,259 @@ def log_event(msg: str):
         STATS["recent_logs"].pop(0)
 
 # ==========================================
+# 1.1. SQLITE WAL TELEMETRY & EVENT-DRIVEN MAINTENANCE (Phase 5 & 6)
+# ==========================================
+TELEMETRY_MAX_QUEUE = 2048
+TELEMETRY_BATCH_SIZE = 64
+MAX_TELEMETRY_ROWS = 50_000
+TARGET_TELEMETRY_ROWS = 45_000
+MAX_DB_BYTES = 2 * 1024 * 1024  # 2 MB hard cap
+TELEMETRY_DB_PATH = CURRENT_DIR / "telemetry.db"
+
+class TelemetryKind(enum.IntEnum):
+    REQUEST = 1
+    SUCCESS = 2
+    FAILURE = 3
+    STATE_TRANSITION = 4
+    FAILOVER = 5
+    WATCHDOG = 6
+    PRUNE = 7
+
+class StateCode(enum.IntEnum):
+    CLOSED = 0
+    OPEN = 1
+    HALF_OPEN = 2
+
+PROVIDER_CODE_MAP = {
+    "none": 0,
+    "thuaquan228@gmail.com": 1,
+    "giabaohuynh0512@gmail.com": 2,
+    "baohuynhgia0512@gmail.com": 3,
+    "junax2288@gmail.com": 4,
+    "ENV_DEFAULT": 5,
+    "tier4_cliproxyapi": 6,
+}
+
+def get_provider_code(name: str) -> int:
+    if name in PROVIDER_CODE_MAP:
+        return PROVIDER_CODE_MAP[name]
+    return 10 + (abs(hash(name)) % 90)
+
+@dataclass(slots=True)
+class TelemetryEvent:
+    ts: int
+    kind: int
+    provider: int
+    latency_ms: Optional[int] = None
+    state: Optional[int] = None
+    value: Optional[int] = None
+
+class TelemetryStore:
+    def __init__(self, db_path: Path):
+        self.db_path = str(db_path)
+        self.queue: queue.Queue = queue.Queue(maxsize=TELEMETRY_MAX_QUEUE)
+        self._stop = threading.Event()
+        self._thread = threading.Thread(
+            target=self._writer_loop,
+            name="laros-telemetry",
+            daemon=True
+        )
+        self.dropped_events = 0
+        self._insert_count = 0
+
+    def start(self):
+        if not self._thread.is_alive():
+            self._thread.start()
+
+    def emit(
+        self,
+        kind: int,
+        provider: int = 0,
+        latency_ms: Optional[int] = None,
+        state: Optional[int] = None,
+        value: Optional[int] = None,
+    ):
+        event = TelemetryEvent(
+            ts=time.time_ns() // 1_000_000,
+            kind=int(kind),
+            provider=int(provider),
+            latency_ms=int(latency_ms) if latency_ms is not None else None,
+            state=int(state) if state is not None else None,
+            value=int(value) if value is not None else None,
+        )
+        try:
+            self.queue.put_nowait(event)
+        except queue.Full:
+            self.dropped_events += 1
+
+    def stop(self):
+        self._stop.set()
+        if self._thread.is_alive():
+            self._thread.join(timeout=2.0)
+
+    def _open(self):
+        conn = sqlite3.connect(
+            self.db_path,
+            timeout=0.1,
+            isolation_level=None
+        )
+        conn.execute("PRAGMA journal_mode=WAL")
+        conn.execute("PRAGMA synchronous=NORMAL")
+        conn.execute("PRAGMA temp_store=MEMORY")
+        conn.execute("PRAGMA cache_size=-256")
+        conn.execute("PRAGMA wal_autocheckpoint=256")
+        conn.execute("PRAGMA journal_size_limit=1048576")
+        conn.execute("PRAGMA busy_timeout=100")
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS telemetry_events (
+                id INTEGER PRIMARY KEY,
+                ts INTEGER NOT NULL,
+                kind INTEGER NOT NULL,
+                provider INTEGER NOT NULL,
+                latency_ms INTEGER,
+                state INTEGER,
+                value INTEGER
+            )
+        """)
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_telemetry_ts ON telemetry_events(ts)")
+        return conn
+
+    def _writer_loop(self):
+        conn = None
+        try:
+            conn = self._open()
+            while True:
+                try:
+                    first = self.queue.get(timeout=0.5)
+                except queue.Empty:
+                    if self._stop.is_set():
+                        break
+                    continue
+
+                batch = [first]
+                while len(batch) < TELEMETRY_BATCH_SIZE:
+                    try:
+                        batch.append(self.queue.get_nowait())
+                    except queue.Empty:
+                        break
+
+                self._write_batch(conn, batch)
+                for _ in batch:
+                    self.queue.task_done()
+        except Exception:
+            pass
+        finally:
+            if conn is not None:
+                try:
+                    conn.execute("PRAGMA wal_checkpoint(PASSIVE)")
+                except Exception:
+                    pass
+                try:
+                    conn.close()
+                except Exception:
+                    pass
+
+    def _write_batch(self, conn, batch):
+        try:
+            conn.execute("BEGIN")
+            conn.executemany(
+                """
+                INSERT INTO telemetry_events (ts, kind, provider, latency_ms, state, value)
+                VALUES (?, ?, ?, ?, ?, ?)
+                """,
+                [
+                    (e.ts, e.kind, e.provider, e.latency_ms, e.state, e.value)
+                    for e in batch
+                ]
+            )
+            conn.execute("COMMIT")
+        except Exception:
+            try:
+                conn.execute("ROLLBACK")
+            except Exception:
+                pass
+            return
+
+        self._insert_count += len(batch)
+        if self._insert_count >= 512:
+            self._insert_count = 0
+            self._maintenance(conn)
+
+    def _database_size_bytes(self) -> int:
+        total = 0
+        try:
+            if os.path.exists(self.db_path):
+                total += os.path.getsize(self.db_path)
+            wal_path = self.db_path + "-wal"
+            if os.path.exists(wal_path):
+                total += os.path.getsize(wal_path)
+        except OSError:
+            pass
+        return total
+
+    def _maintenance(self, conn):
+        try:
+            count = conn.execute("SELECT COUNT(*) FROM telemetry_events").fetchone()[0]
+            current_bytes = self._database_size_bytes()
+            oversized = current_bytes > MAX_DB_BYTES
+            if count > MAX_TELEMETRY_ROWS or oversized:
+                target = 40_000 if oversized else 45_000
+                delete_n = max(0, count - target)
+                if delete_n > 0:
+                    conn.execute(
+                        """
+                        DELETE FROM telemetry_events
+                        WHERE id IN (
+                            SELECT id FROM telemetry_events
+                            ORDER BY id ASC
+                            LIMIT ?
+                        )
+                        """,
+                        (delete_n,)
+                    )
+                    conn.execute("PRAGMA wal_checkpoint(PASSIVE)")
+        except Exception:
+            pass
+
+    def snapshot(self) -> dict:
+        total_events = 0
+        last_event = None
+        db_size_kb = round(self._database_size_bytes() / 1024.0, 1)
+        try:
+            conn = sqlite3.connect(self.db_path, timeout=0.1)
+            try:
+                row = conn.execute("SELECT COUNT(*) FROM telemetry_events").fetchone()
+                if row:
+                    total_events = row[0]
+                last_row = conn.execute(
+                    "SELECT ts, kind, provider, latency_ms, state, value FROM telemetry_events ORDER BY id DESC LIMIT 1"
+                ).fetchone()
+                if last_row:
+                    last_event = {
+                        "ts": last_row[0],
+                        "kind": last_row[1],
+                        "provider": last_row[2],
+                        "latency_ms": last_row[3],
+                        "state": last_row[4],
+                        "value": last_row[5],
+                    }
+            finally:
+                conn.close()
+        except Exception:
+            pass
+
+        return {
+            "total_events": total_events,
+            "last_event": last_event,
+            "queue_depth": self.queue.qsize(),
+            "dropped_events": self.dropped_events,
+            "db_size_kb": db_size_kb,
+            "max_db_bytes": MAX_DB_BYTES
+        }
+
+telemetry_store = TelemetryStore(TELEMETRY_DB_PATH)
+
+# ==========================================
 # 2. RTK PROMPT COMPACTOR (from 9router)
 # ==========================================
 def rtk_compact_text(text: str) -> tuple[str, int]:
@@ -203,6 +459,11 @@ class CircuitBreaker:
                 # Cooldown expired -> enter HALF_OPEN test mode
                 self.state = CircuitState.HALF_OPEN
                 self.probe_in_flight = False
+                telemetry_store.emit(
+                    kind=TelemetryKind.STATE_TRANSITION,
+                    provider=get_provider_code(self.name),
+                    state=StateCode.HALF_OPEN
+                )
             if self.state == CircuitState.HALF_OPEN:
                 if self.probe_in_flight:
                     return False
@@ -219,11 +480,18 @@ class CircuitBreaker:
                     self.latency_ema = (
                         EMA_ALPHA * latency_ms + (1.0 - EMA_ALPHA) * self.latency_ema
                     )
+            old_state = self.state
             self.state = CircuitState.CLOSED
             self.opened_until = 0.0
             self.failure_count = 0
             self.success_count += 1
             self.probe_in_flight = False
+            if old_state != CircuitState.CLOSED:
+                telemetry_store.emit(
+                    kind=TelemetryKind.STATE_TRANSITION,
+                    provider=get_provider_code(self.name),
+                    state=StateCode.CLOSED
+                )
 
     async def record_failure(self, kind: FailureKind = FailureKind.TIMEOUT) -> None:
         cooldown = self._cooldown_for(kind)
@@ -235,6 +503,12 @@ class CircuitBreaker:
             self.opened_until = self._now() + duration
             self.probe_in_flight = False
             log_event(f"⚠️ Circuit '{self.name}' -> OPEN for {duration:.1f}s (Reason: {kind.value}, Jitter: +{jitter:.1f}s)")
+            telemetry_store.emit(
+                kind=TelemetryKind.STATE_TRANSITION,
+                provider=get_provider_code(self.name),
+                state=StateCode.OPEN,
+                value=int(duration)
+            )
 
     def _health_score_unlocked(self) -> float:
         if self.state is CircuitState.OPEN:
@@ -342,6 +616,7 @@ class CLIProxyWatchdog:
         )
         self._restart_delay = 1.0
         log_event(f"✓ CLIProxyAPI spawned successfully (PID: {self._process.pid})")
+        telemetry_store.emit(kind=TelemetryKind.WATCHDOG, provider=6, value=self._process.pid)
 
     async def _terminate_process(self) -> None:
         process = self._process
@@ -390,6 +665,7 @@ class CLIProxyWatchdog:
             self._process = None
             self._total_restarts += 1
             log_event(f"⚠️ CLIProxyAPI exited with code {returncode}! Watchdog auto-restart in {self._restart_delay}s (Restart #{self._total_restarts})...")
+            telemetry_store.emit(kind=TelemetryKind.WATCHDOG, provider=6, value=self._total_restarts)
             await self._sleep_or_stop(self._restart_delay)
             self._restart_delay = min(self._restart_delay * 2.0, 60.0)
 
@@ -439,7 +715,7 @@ def set_cached_response(prompt_hash: str, response: Any):
 # ==========================================
 # 5. FASTAPI APP & REGISTRY
 # ==========================================
-app = FastAPI(title="LAR-OS Unified AI Gateway v3.2", version="3.2.0-adaptive-scoring")
+app = FastAPI(title="LAR-OS Unified AI Gateway v3.3", version="3.3.0-wal-telemetry")
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -452,13 +728,15 @@ cli_watchdog = CLIProxyWatchdog(executable=CLIPROXY_EXE, config=CLIPROXY_CONFIG)
 
 @app.on_event("startup")
 async def on_startup():
+    telemetry_store.start()
     await cli_watchdog.start()
-    log_event("🚀 LAR-OS Gateway v3.1 online. CLIProxyWatchdog active on port 18798.")
+    log_event("🚀 LAR-OS Gateway v3.3 online. CLIProxyWatchdog & SQLite WAL Telemetry active.")
 
 @app.on_event("shutdown")
 async def on_shutdown():
     await cli_watchdog.stop()
-    log_event("🛑 LAR-OS Gateway shutdown. CLIProxyWatchdog cleanly stopped.")
+    telemetry_store.stop()
+    log_event("🛑 LAR-OS Gateway shutdown. CLIProxyWatchdog & SQLite Telemetry cleanly stopped.")
 
 MODELS_REGISTRY = [
     {"id": "gemini-3.5-flash-lite", "object": "model", "created": 1780000000, "owned_by": "google", "description": "Google Gemini 3.5 Flash-Lite (High throughput, 1M context, sub-agent loop)"},
@@ -560,6 +838,7 @@ async def execute_model_request(model: str, messages: List[Dict[str, Any]], tool
 
     full_query = (system_prompt + "\n\n" + user_prompt).strip() if system_prompt else user_prompt
     compacted_query, saved = rtk_compact_text(full_query)
+    telemetry_store.emit(kind=TelemetryKind.REQUEST, provider=0)
     
     # Check cache (only if no tools are invoked)
     p_hash = hashlib.md5((compacted_query + "_" + str(tools)).encode("utf-8")).hexdigest()
@@ -685,16 +964,31 @@ async def execute_model_request(model: str, messages: List[Dict[str, Any]], tool
                     curr_s = await cb.health_score()
                     log_event(f"✓ FULFILLED by {acc} ({target_model}) in {elapsed_ms:.0f}ms | Score: {curr_s:.1f} | EMA: {cb.latency_ema:.0f}ms | RTK: -{saved} chars")
                     set_cached_response(p_hash, res_dict)
+                    telemetry_store.emit(
+                        kind=TelemetryKind.SUCCESS,
+                        provider=get_provider_code(acc),
+                        latency_ms=int(elapsed_ms),
+                        state=StateCode.CLOSED
+                    )
                     return res_dict
             except Exception as e:
                 err_msg = str(e).lower()
                 if "429" in err_msg or "resource_exhausted" in err_msg:
                     kind = FailureKind.HTTP_429
+                    err_val = 429
                 elif "500" in err_msg or "503" in err_msg or "502" in err_msg:
                     kind = FailureKind.HTTP_5XX
+                    err_val = 500
                 else:
                     kind = FailureKind.TIMEOUT
+                    err_val = 408
                 await cb.record_failure(kind)
+                telemetry_store.emit(
+                    kind=TelemetryKind.FAILURE,
+                    provider=get_provider_code(acc),
+                    state=StateCode.OPEN,
+                    value=err_val
+                )
                 continue
     else:
         log_event("🔄 All primary Gemini circuits in OPEN state (Score <= 0). Fast-falling back to Tier-4...")
@@ -703,6 +997,7 @@ async def execute_model_request(model: str, messages: List[Dict[str, Any]], tool
     t4_cb = get_circuit("tier4_cliproxyapi")
     if await t4_cb.allow_request():
         log_event("🛡️ Activating TIER 4 FAILOVER (CLIProxyAPI Antigravity)...")
+        telemetry_store.emit(kind=TelemetryKind.FAILOVER, provider=0, value=6)
         t4_start = time.monotonic()
         try:
             failover_res = await asyncio.wait_for(
@@ -714,11 +1009,23 @@ async def execute_model_request(model: str, messages: List[Dict[str, Any]], tool
                 await t4_cb.record_success(t4_elapsed_ms)
                 log_event(f"✨ TIER 4 FULFILLED by Antigravity Free Proxy ({target_model}) in {t4_elapsed_ms:.0f}ms (EMA: {t4_cb.latency_ema:.0f}ms)!")
                 set_cached_response(p_hash, failover_res)
+                telemetry_store.emit(
+                    kind=TelemetryKind.SUCCESS,
+                    provider=6,
+                    latency_ms=int(t4_elapsed_ms),
+                    state=StateCode.CLOSED
+                )
                 return failover_res
         except Exception as e_failover:
             err_msg = str(e_failover).lower()
             kind = FailureKind.HTTP_429 if "429" in err_msg else FailureKind.TIMEOUT
             await t4_cb.record_failure(kind)
+            telemetry_store.emit(
+                kind=TelemetryKind.FAILURE,
+                provider=6,
+                state=StateCode.OPEN,
+                value=429 if "429" in err_msg else 408
+            )
             log_event(f"❌ Tier 4 Failover error: {e_failover}")
 
     return {"text": "[LAR-OS Gateway Failover] All active accounts and failover circuits are currently cooling down. Retry shortly.", "tool_calls": []}
@@ -732,10 +1039,11 @@ async def health_check():
     circuits_snapshot = [await cb.snapshot() for cb in CIRCUITS.values()]
     drive_info = drive_connector.get_status() if drive_connector else {"status": "UNAVAILABLE"}
     watchdog_stat = cli_watchdog.status()
+    telemetry_stat = telemetry_store.snapshot()
     return {
         "status": "ONLINE",
-        "service": "LAR-OS Unified AI Gateway v3.1 (Self-Healing)",
-        "architecture": "Supervised 4-Tier Heterogeneous Redundancy + 3-State Circuit Breakers",
+        "service": "LAR-OS Unified AI Gateway v3.3 (Adaptive Scoring & WAL Telemetry)",
+        "architecture": "Supervised 4-Tier Heterogeneous Redundancy + 3-State Circuit Breakers + SQLite WAL Telemetry",
         "uptime_seconds": int(time.time() - STATS["start_time"]),
         "total_requests": STATS["total_requests"],
         "cache_hits": STATS["cache_hits"],
@@ -745,7 +1053,26 @@ async def health_check():
         "tier4_watchdog": watchdog_stat,
         "tier4_failover": "ONLINE (Supervised by Watchdog, Port 18798)" if watchdog_stat.get("running") else "OFFLINE",
         "cache_entries": len(RESPONSE_CACHE),
+        "telemetry": telemetry_stat,
         "google_drive": drive_info
+    }
+
+@app.get("/status")
+@app.get("/v1/status")
+async def gateway_status():
+    circuits_snapshot = [await cb.snapshot() for cb in CIRCUITS.values()]
+    watchdog_stat = cli_watchdog.status()
+    telemetry_stat = telemetry_store.snapshot()
+    return {
+        "status": "ONLINE",
+        "service": "LAR-OS Unified AI Gateway v3.3",
+        "uptime_seconds": int(time.time() - STATS["start_time"]),
+        "total_requests": STATS["total_requests"],
+        "cache_hits": STATS["cache_hits"],
+        "tokens_saved_chars": STATS["tokens_saved_chars"],
+        "telemetry": telemetry_stat,
+        "circuits": circuits_snapshot,
+        "watchdog": watchdog_stat
     }
 
 @app.get("/v1/drive/status")
