@@ -135,12 +135,17 @@ def rtk_compact_text(text: str) -> tuple[str, int]:
     return compacted, saved
 
 # ==========================================
-# 3. STANDARDIZED 3-STATE CIRCUIT BREAKER + JITTER (Phase 2)
+# 3. STANDARDIZED 3-STATE CIRCUIT BREAKER + ADAPTIVE HEALTH SCORING & LATENCY EMA (Phase 2, 3 & 4)
 # ==========================================
 COOLDOWN_429 = 60.0
 COOLDOWN_TIMEOUT = 30.0
 COOLDOWN_5XX = 15.0
 JITTER_MAX = 15.0
+
+EMA_ALPHA = 0.2
+FAILURE_PENALTY = 10.0
+LATENCY_DIVISOR_MS = 100.0
+HALF_OPEN_SCORE = 15.0
 
 class CircuitState(str, enum.Enum):
     CLOSED = "closed"
@@ -155,17 +160,22 @@ class FailureKind(str, enum.Enum):
 @dataclass
 class CircuitBreaker:
     """
-    Asyncio-safe, non-blocking 3-state circuit breaker with jitter.
+    Asyncio-safe, non-blocking 3-state circuit breaker with:
+      - Exponential Moving Average (EMA) latency tracking (alpha = 0.2)
+      - Dynamic Adaptive Health Score (0 to 100)
+      - Jittered cooldowns on failures
     Invariants:
-      - OPEN providers are never routed to.
-      - Exactly one probe allowed when HALF_OPEN.
+      - OPEN providers are scored -1 and never routed to.
+      - Exactly one probe allowed when HALF_OPEN (scored 15).
       - Lock is never held across an await.
-      - Cooldown uses monotonic time to prevent clock skew.
+      - Monotonic clock used throughout.
     """
     name: str
     state: CircuitState = CircuitState.CLOSED
     opened_until: float = 0.0
     failure_count: int = 0
+    success_count: int = 0
+    latency_ema: Optional[float] = None
     probe_in_flight: bool = False
     _lock: asyncio.Lock = field(default_factory=asyncio.Lock)
 
@@ -200,11 +210,19 @@ class CircuitBreaker:
                 return True
             return False
 
-    async def record_success(self) -> None:
+    async def record_success(self, latency_ms: float = 0.0) -> None:
         async with self._lock:
+            if latency_ms > 0:
+                if self.latency_ema is None:
+                    self.latency_ema = float(latency_ms)
+                else:
+                    self.latency_ema = (
+                        EMA_ALPHA * latency_ms + (1.0 - EMA_ALPHA) * self.latency_ema
+                    )
             self.state = CircuitState.CLOSED
             self.opened_until = 0.0
             self.failure_count = 0
+            self.success_count += 1
             self.probe_in_flight = False
 
     async def record_failure(self, kind: FailureKind = FailureKind.TIMEOUT) -> None:
@@ -218,13 +236,31 @@ class CircuitBreaker:
             self.probe_in_flight = False
             log_event(f"⚠️ Circuit '{self.name}' -> OPEN for {duration:.1f}s (Reason: {kind.value}, Jitter: +{jitter:.1f}s)")
 
+    def _health_score_unlocked(self) -> float:
+        if self.state is CircuitState.OPEN:
+            return -1.0
+        if self.state is CircuitState.HALF_OPEN:
+            return HALF_OPEN_SCORE
+        score = 100.0
+        score -= min(self.failure_count * FAILURE_PENALTY, 40.0)
+        if self.latency_ema is not None:
+            score -= min(self.latency_ema / LATENCY_DIVISOR_MS, 40.0)
+        return max(0.0, min(100.0, score))
+
+    async def health_score(self) -> float:
+        async with self._lock:
+            return self._health_score_unlocked()
+
     async def snapshot(self) -> dict:
         async with self._lock:
             remaining = max(0.0, self.opened_until - self._now())
             return {
                 "name": self.name,
                 "state": self.state.value,
+                "health_score": round(self._health_score_unlocked(), 1),
+                "latency_ema_ms": round(self.latency_ema, 1) if self.latency_ema is not None else None,
                 "failure_count": self.failure_count,
+                "success_count": self.success_count,
                 "cooldown_remaining_sec": round(remaining, 1),
                 "probe_in_flight": self.probe_in_flight
             }
@@ -403,7 +439,7 @@ def set_cached_response(prompt_hash: str, response: Any):
 # ==========================================
 # 5. FASTAPI APP & REGISTRY
 # ==========================================
-app = FastAPI(title="LAR-OS Unified AI Gateway v3.1", version="3.1.0-self-healing")
+app = FastAPI(title="LAR-OS Unified AI Gateway v3.2", version="3.2.0-adaptive-scoring")
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -455,14 +491,14 @@ CLIPROXY_URL = "http://127.0.0.1:18798/v1/chat/completions"
 CLIPROXY_KEY = "lar-os-failover-key"
 
 def _call_cliproxy_sync(model: str, prompt: str, tools: Optional[List[Dict[str, Any]]] = None) -> Optional[Dict[str, Any]]:
-    ag_model = "gemini-3.1-flash-lite"
+    ag_model = "gemini-3-flash"
     m_lower = model.lower()
     if "claude" in m_lower or "sonnet" in m_lower or "opus" in m_lower:
         ag_model = "claude-sonnet-4-6"
     elif "pro" in m_lower:
         ag_model = "gemini-3.1-pro-low"
     elif "flash" in m_lower:
-        ag_model = "gemini-3.1-flash-lite"
+        ag_model = "gemini-3-flash"
         
     payload = {
         "model": ag_model,
@@ -583,11 +619,18 @@ async def execute_model_request(model: str, messages: List[Dict[str, Any]], tool
     global _round_robin_counter
     target_model = "gemini-3.5-flash-lite" if ("flash" in model or "2.5" in model or "claude" in model) else model
     
-    healthy_keys = []
+    # Dynamic Priority Selection via Adaptive Health Scoring (Phase 3 & 4)
+    scored_keys = []
     for k in keys_pool:
         cb = get_circuit(k["account"])
         if await cb.allow_request():
-            healthy_keys.append(k)
+            s = await cb.health_score()
+            if s > 0:
+                scored_keys.append((s, k))
+
+    # Highest health score first (fastest, most reliable provider)
+    scored_keys.sort(key=lambda x: x[0], reverse=True)
+    ordered_pool = [k for _, k in scored_keys]
 
     # Convert tools if provided
     gemini_tools = translate_anthropic_tools_to_gemini(tools) if tools else None
@@ -626,23 +669,21 @@ async def execute_model_request(model: str, messages: List[Dict[str, Any]], tool
                 return {"text": resp_text, "tool_calls": tool_calls}
         return None
 
-    if healthy_keys:
-        n_keys = len(healthy_keys)
-        start_idx = _round_robin_counter % n_keys
-        _round_robin_counter += 1
-        ordered_pool = healthy_keys[start_idx:] + healthy_keys[:start_idx]
-
+    if ordered_pool:
         for key_entry in ordered_pool:
             acc = key_entry["account"]
             cb = get_circuit(acc)
+            t_start = time.monotonic()
             try:
                 res_dict = await asyncio.wait_for(
                     asyncio.to_thread(_do_request_sync, key_entry["key"], target_model, compacted_query, gemini_tools),
                     timeout=12.5
                 )
+                elapsed_ms = (time.monotonic() - t_start) * 1000.0
                 if res_dict:
-                    await cb.record_success()
-                    log_event(f"✓ FULFILLED by {acc} ({target_model}) | RTK: -{saved} chars")
+                    await cb.record_success(elapsed_ms)
+                    curr_s = await cb.health_score()
+                    log_event(f"✓ FULFILLED by {acc} ({target_model}) in {elapsed_ms:.0f}ms | Score: {curr_s:.1f} | EMA: {cb.latency_ema:.0f}ms | RTK: -{saved} chars")
                     set_cached_response(p_hash, res_dict)
                     return res_dict
             except Exception as e:
@@ -656,20 +697,22 @@ async def execute_model_request(model: str, messages: List[Dict[str, Any]], tool
                 await cb.record_failure(kind)
                 continue
     else:
-        log_event("🔄 All primary Gemini circuits in OPEN state. Fast-falling back to Tier-4...")
+        log_event("🔄 All primary Gemini circuits in OPEN state (Score <= 0). Fast-falling back to Tier-4...")
 
     # Tier 4: Antigravity OAuth Failover (100% Free Uncapped Backup via CLIProxyAPI)
     t4_cb = get_circuit("tier4_cliproxyapi")
     if await t4_cb.allow_request():
         log_event("🛡️ Activating TIER 4 FAILOVER (CLIProxyAPI Antigravity)...")
+        t4_start = time.monotonic()
         try:
             failover_res = await asyncio.wait_for(
                 asyncio.to_thread(_call_cliproxy_sync, target_model, compacted_query, tools),
                 timeout=30.0
             )
+            t4_elapsed_ms = (time.monotonic() - t4_start) * 1000.0
             if failover_res and failover_res.get("text"):
-                await t4_cb.record_success()
-                log_event(f"✨ TIER 4 FULFILLED by Antigravity Free Proxy ({target_model})!")
+                await t4_cb.record_success(t4_elapsed_ms)
+                log_event(f"✨ TIER 4 FULFILLED by Antigravity Free Proxy ({target_model}) in {t4_elapsed_ms:.0f}ms (EMA: {t4_cb.latency_ema:.0f}ms)!")
                 set_cached_response(p_hash, failover_res)
                 return failover_res
         except Exception as e_failover:
