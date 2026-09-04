@@ -24,7 +24,7 @@ AI_TARGETS = {
         "name": "ChatGPT (OpenAI)",
         "url": "https://chatgpt.com/",
         "login_url": "https://chatgpt.com/auth/login",
-        "input_selector": "#prompt-textarea, .ProseMirror, textarea",
+        "input_selector": "form #prompt-textarea, footer #prompt-textarea, #composer-background #prompt-textarea, #prompt-textarea",
         "send_selector": "#composer-submit-button, button[data-testid='send-button'], button[aria-label='Gửi câu lệnh'], button[aria-label='Gửi tin nhắn'], button[aria-label='Send message']",
         "stop_selector": "button[aria-label*='Dừng'], button[aria-label*='Stop'], button[data-testid='stop-button']",
         "response_selector": "article, div[data-message-author-role='assistant'], div.agent-turn, div.markdown"
@@ -161,9 +161,13 @@ class OperaNeonBridge:
         """
         val = await self.evaluate_js(ws_url, js_probe)
         try:
-            return json.loads(val)
+            res = json.loads(val) if val else {}
+            if isinstance(res, dict):
+                res.setdefault("engine", engine)
+                return res
+            return {"engine": engine, "raw": val}
         except Exception:
-            return {"raw": val}
+            return {"engine": engine, "raw": val}
 
     async def consult_ai(self, engine: str, prompt: str, timeout_seconds: int = 45) -> Dict[str, Any]:
         cfg = AI_TARGETS.get(engine, AI_TARGETS["chatgpt"])
@@ -189,25 +193,42 @@ class OperaNeonBridge:
             await self.execute_cdp(ws_url, "Page.navigate", {"url": cfg["url"]})
             await asyncio.sleep(4)
             
-        # Inject prompt using native property setter to bypass React 18 synthetic wrapper
+        # Inject prompt using hardened bottom-composer finder to prevent targeting past message edits ("Sửa") or Canvas writing panels
         escaped_prompt = json.dumps(prompt)
         inject_js = f"""
         (async function() {{
-            var input = document.querySelector("{cfg['input_selector']}");
-            if (!input) return {{ ok: false, error: "Input selector not found" }};
+            function findChatInput() {{
+                // Strictly exclude elements inside past articles (editing previous messages) or Canvas surfaces
+                var candidates = Array.from(document.querySelectorAll('#prompt-textarea, form [contenteditable="true"], footer [contenteditable="true"], div[contenteditable="true"], textarea'));
+                var filtered = candidates.filter(function(el) {{
+                    return !el.closest('article') && !el.closest('[data-testid*="canvas"]') && !el.closest('.canvas-container') && !el.closest('.writing-surface');
+                }});
+                
+                // Pick the bottom-most element (canonical footer chat composer)
+                var best = null;
+                var maxY = -1;
+                for (var el of filtered) {{
+                    var r = el.getBoundingClientRect();
+                    if (r.bottom > maxY && r.width > 40 && r.height > 15) {{
+                        maxY = r.bottom;
+                        best = el;
+                    }}
+                }}
+                return best || document.querySelector('form #prompt-textarea') || document.querySelector('#prompt-textarea');
+            }}
+
+            var input = findChatInput();
+            if (!input) return {{ ok: false, error: "Canonical chat composer not found" }};
             
             input.focus();
             if (input.getAttribute('contenteditable') === 'true' || input.classList.contains('ProseMirror')) {{
-                document.execCommand('selectAll', false, null);
-                document.execCommand('insertText', false, {escaped_prompt});
-                input.dispatchEvent(new Event('input', {{ bubbles: true }}));
-            }} else if (input.tagName === 'TEXTAREA') {{
-                var setter = Object.getOwnPropertyDescriptor(window.HTMLTextAreaElement.prototype, "value").set;
-                setter.call(input, {escaped_prompt});
+                // ProseMirror in React 18: innerHTML paragraph + input/change dispatch
+                input.innerHTML = '<p>' + {escaped_prompt}.replace(/\\n/g, '<br>') + '</p>';
                 input.dispatchEvent(new Event('input', {{ bubbles: true }}));
                 input.dispatchEvent(new Event('change', {{ bubbles: true }}));
-            }} else if (input.tagName === 'INPUT') {{
-                var setter = Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype, "value").set;
+            }} else if (input.tagName === 'TEXTAREA' || input.tagName === 'INPUT') {{
+                var proto = input.tagName === 'TEXTAREA' ? window.HTMLTextAreaElement.prototype : window.HTMLInputElement.prototype;
+                var setter = Object.getOwnPropertyDescriptor(proto, "value").set;
                 setter.call(input, {escaped_prompt});
                 input.dispatchEvent(new Event('input', {{ bubbles: true }}));
                 input.dispatchEvent(new Event('change', {{ bubbles: true }}));
@@ -216,11 +237,14 @@ class OperaNeonBridge:
                 input.dispatchEvent(new Event('input', {{ bubbles: true }}));
             }}
             
-            // Poll for send button to become enabled
-            for (var i = 0; i < 12; i++) {{
+            // Poll for send button inside composer container to become enabled
+            for (var i = 0; i < 15; i++) {{
                 await new Promise(r => setTimeout(r, 100));
-                var sendBtn = document.querySelector('#composer-submit-button') || 
-                              document.querySelector('button[data-testid="send-button"]') || 
+                var container = input.closest('form, #composer-background, footer, [data-testid="composer"]') || document;
+                var sendBtn = container.querySelector('#composer-submit-button') || 
+                              container.querySelector('button[data-testid="send-button"]') || 
+                              container.querySelector('button[aria-label*="Gửi"]') ||
+                              container.querySelector('button[aria-label*="Send"]') ||
                               document.querySelector("{cfg['send_selector']}");
                 if (sendBtn && !sendBtn.disabled && sendBtn.getAttribute('aria-disabled') !== 'true') {{
                     sendBtn.click();
