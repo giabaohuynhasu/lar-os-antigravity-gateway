@@ -42,6 +42,13 @@ except Exception:
     query_m365_copilot = None
 
 try:
+    from m365_subagents import dispatch_m365_subagent, M365_SUBAGENTS, list_subagents
+except Exception:
+    dispatch_m365_subagent = None
+    M365_SUBAGENTS = {}
+    list_subagents = lambda: []
+
+try:
     from comet_perplexity_bridge import query_perplexity_comet
 except Exception:
     query_perplexity_comet = None
@@ -527,6 +534,25 @@ MCP_TOOLS_DEFINITIONS = [
             },
             "required": ["hypothesis"]
         }
+    },
+    {
+        "name": "m365_subagent_dispatch",
+        "description": "Dispatch task to a specialized M365 Copilot Sub-Agent (bio_audit, epistemic_3rd, synthesis_core, devops_sentinel, institutional_strategist) with zero quota consumption.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "agent_id": {
+                    "type": "string",
+                    "enum": ["bio_audit", "epistemic_3rd", "synthesis_core", "devops_sentinel", "institutional_strategist"],
+                    "description": "ID of the specialized M365 Copilot Sub-Agent"
+                },
+                "prompt": {
+                    "type": "string",
+                    "description": "The research task or audit query for the sub-agent."
+                }
+            },
+            "required": ["agent_id", "prompt"]
+        }
     }
 ]
 
@@ -573,6 +599,14 @@ async def handle_mcp_jsonrpc(body: Dict[str, Any]) -> Dict[str, Any]:
                     result_text = res.get("response", str(res))
                 else:
                     result_text = "M365 Copilot bridge not initialized."
+            elif tool_name == "m365_subagent_dispatch":
+                if dispatch_m365_subagent:
+                    aid = args.get("agent_id", "epistemic_3rd")
+                    p = args.get("prompt", "")
+                    sub_res = await dispatch_m365_subagent(aid, p)
+                    result_text = sub_res.get("report", str(sub_res))
+                else:
+                    result_text = "M365 sub-agents module not loaded."
             elif tool_name == "perplexity_comet_search":
                 if query_perplexity_comet:
                     res = await query_perplexity_comet(args.get("query", ""))
@@ -682,6 +716,30 @@ async def mcp_unified_endpoint(request: Request):
         "tools_count": len(MCP_TOOLS_DEFINITIONS),
         "tools": [t["name"] for t in MCP_TOOLS_DEFINITIONS]
     })
+
+# ==========================================
+# 8c. M365 SUB-AGENT REST ENDPOINTS
+# ==========================================
+@app.get("/m365/subagents")
+async def get_m365_subagents_api():
+    """Returns the list of active M365 Copilot Sub-Agents."""
+    return JSONResponse({"subagents": list_subagents()})
+
+@app.post("/m365/subagent/{agent_id}")
+async def call_m365_subagent_api(agent_id: str, request: Request):
+    """Executes a specialized M365 Copilot Sub-Agent with zero quota consumption."""
+    try:
+        body = await request.json()
+    except Exception:
+        raise HTTPException(status_code=400, detail="Invalid JSON body")
+    prompt = body.get("prompt", "")
+    if not prompt:
+        raise HTTPException(status_code=400, detail="Field 'prompt' is required")
+    if dispatch_m365_subagent:
+        res = await dispatch_m365_subagent(agent_id, prompt)
+        return JSONResponse(res)
+    else:
+        raise HTTPException(status_code=503, detail="M365 Sub-Agent engine offline")
 
 # ==========================================
 # 9. EMBEDDED WEB DASHBOARD
