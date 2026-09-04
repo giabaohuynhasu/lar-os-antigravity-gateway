@@ -19,3 +19,10 @@ env/
 Thumbs.db
 .vscode/
 .idea/
+
+# Local Runtime & Proxies
+TUNNEL_URL.txt
+cliproxyapi/
+*.png
+*.jpg
+*.log

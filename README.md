@@ -50,11 +50,17 @@ It serves as the runtime backbone for **LAR-OS (Longevity & Asymmetry Research O
 - Returns responses in **0.30 seconds** with **0 quota consumed**.
 - Strictly bounded to 50 items to prevent RAM bloat.
 
-### 5. Live Embedded Web Dashboard (`http://127.0.0.1:18797/dashboard`)
+### 5. Tier 4 Unbreakable Failover (Antigravity 100% Free OAuth Proxy)
+- Employs an ultra-lightweight Go-native `CLIProxyAPI` daemon (<25MB RAM) listening on `127.0.0.1:18798`.
+- Hooks directly into the official Google CloudCode Developer API (`https://cloudcode-pa.googleapis.com/v1internal`) via OAuth2 without consuming paid API Studio quota.
+- Automatically kicks in when all primary Gemini Pro keys hit HTTP 429 cooldown, ensuring zero-downtime execution for autonomous agents.
+- Exposes free developer-tier models: `gemini-3.1-flash-lite`, `gemini-3-flash`, `gemini-3.1-pro-low`, and `claude-sonnet-4-6`.
+
+### 6. Live Embedded Web Dashboard (`http://127.0.0.1:18797/dashboard`)
 - High-aesthetic dark-mode interface with Glassmorphism styling.
 - Live telemetry: Request counters, cache hit rates, RTK character savings, and real-time Google AI Pro account status.
 
-### 6. Opera Neon Browser Substrate & Zero-Quota Frontier AI Harvesting
+### 7. Opera Neon Browser Substrate & Zero-Quota Frontier AI Harvesting
 - Native integration with Opera Neon AI Browser substrate running on persistent CDP port `9224`.
 - Employs **Token Compression (TOON / AXI)** reducing page DOM overhead by up to 80%.
 - Harnesses user's real, logged-in sessions across **ChatGPT** (GPT-5.6 / o1 / Canvas), **DeepSeek** (DeepSeek-R1 / V3), and **Moonshot Kimi** (Kimi K3) with **zero API costs and zero token consumption**.

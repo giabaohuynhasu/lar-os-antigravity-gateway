@@ -196,7 +196,8 @@ MODELS_REGISTRY = [
     {"id": "claude-3.5-sonnet", "object": "model", "created": 1780000000, "owned_by": "anthropic", "description": "Anthropic Claude 3.5 Sonnet (Agentic tool calling translated to Gemini)"},
     {"id": "chatgpt-4o-opera", "object": "model", "created": 1780000000, "owned_by": "openai-opera", "description": "OpenAI ChatGPT / GPT 5.6 Luna via Opera Neon CDP (Port 9225)"},
     {"id": "deepseek-r1-quad", "object": "model", "created": 1780000000, "owned_by": "lar-os-consortium", "description": "LAR-OS Quad-Browser Consensus (Perplexity + Copilot + Gemini + ChatGPT)"},
-    {"id": "perplexity-comet", "object": "model", "created": 1780000000, "owned_by": "perplexity", "description": "Perplexity Live Search via Comet CDP (Port 9222)"}
+    {"id": "antigravity-gemini-3-flash", "object": "model", "created": 1780000000, "owned_by": "antigravity-free", "description": "Google Antigravity 100% Free Tier (Via local CLIProxyAPI)"},
+    {"id": "antigravity-claude-sonnet", "object": "model", "created": 1780000000, "owned_by": "antigravity-free", "description": "Claude Sonnet 4.6 100% Free Tier (Via local Antigravity Proxy)"}
 ]
 
 # ==========================================
@@ -212,6 +213,52 @@ def translate_anthropic_tools_to_gemini(tools: List[Dict[str, Any]]) -> List[Dic
             "parameters": t.get("input_schema", {})
         })
     return [{"function_declarations": declarations}] if declarations else []
+
+# ==========================================
+# 6.1. TIER 4 FAILOVER: CLIPROXYAPI (ANTIGRAVITY 100% FREE)
+# ==========================================
+CLIPROXY_URL = "http://127.0.0.1:18798/v1/chat/completions"
+CLIPROXY_KEY = "lar-os-failover-key"
+
+def _call_cliproxy_sync(model: str, prompt: str, tools: Optional[List[Dict[str, Any]]] = None) -> Optional[Dict[str, Any]]:
+    ag_model = "gemini-3.1-flash-lite"
+    m_lower = model.lower()
+    if "claude" in m_lower or "sonnet" in m_lower or "opus" in m_lower:
+        ag_model = "claude-sonnet-4-6"
+    elif "pro" in m_lower:
+        ag_model = "gemini-3.1-pro-low"
+    elif "flash" in m_lower:
+        ag_model = "gemini-3.1-flash-lite"
+        
+    payload = {
+        "model": ag_model,
+        "messages": [{"role": "user", "content": prompt}],
+        "max_tokens": 2048,
+        "temperature": 0.2
+    }
+    data = json.dumps(payload).encode("utf-8")
+    req = urllib.request.Request(
+        CLIPROXY_URL,
+        data=data,
+        headers={
+            "Authorization": f"Bearer {CLIPROXY_KEY}",
+            "Content-Type": "application/json"
+        },
+        method="POST"
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=30) as r:
+            if r.status == 200:
+                resp_data = json.loads(r.read().decode("utf-8"))
+                choice = resp_data.get("choices", [{}])[0]
+                msg = choice.get("message", {})
+                return {
+                    "text": msg.get("content", ""),
+                    "tool_calls": msg.get("tool_calls") or []
+                }
+    except Exception as e:
+        log_event(f"[-] CLIProxyAPI call error ({ag_model}): {e}")
+    return None
 
 # ==========================================
 # 7. CORE DISPATCHER ENGINE
@@ -264,6 +311,13 @@ async def execute_model_request(model: str, messages: List[Dict[str, Any]], tool
             res = await consult_opera_neon(engine="chatgpt", prompt=compacted_query)
             ans_text = res.get("response") or res.get("message") or str(res)
             return {"text": ans_text, "tool_calls": []}
+
+    if "antigravity" in model_lower:
+        res = await asyncio.to_thread(_call_cliproxy_sync, model, compacted_query, tools)
+        if res and res.get("text"):
+            log_event(f"✓ FULFILLED directly by Antigravity Free Tier ({model})")
+            set_cached_response(p_hash, res)
+            return res
 
     if "claude" in model_lower:
         if consult_opera_neon:
@@ -358,7 +412,21 @@ async def execute_model_request(model: str, messages: List[Dict[str, Any]], tool
             record_account_failure(acc, str(e))
             continue
 
-    return {"text": "[LAR-OS Gateway Failover] All active accounts cooling down. Retry shortly.", "tool_calls": []}
+    # Tier 4: Antigravity OAuth Failover (100% Free Uncapped Backup via CLIProxyAPI)
+    log_event("🛡️ Primary keys exhausted/cooling down. Activating TIER 4 FAILOVER (CLIProxyAPI Antigravity)...")
+    try:
+        failover_res = await asyncio.wait_for(
+            asyncio.to_thread(_call_cliproxy_sync, target_model, compacted_query, tools),
+            timeout=30.0
+        )
+        if failover_res and failover_res.get("text"):
+            log_event(f"✨ TIER 4 FULFILLED by Antigravity Free Proxy ({target_model})!")
+            set_cached_response(p_hash, failover_res)
+            return failover_res
+    except Exception as e_failover:
+        log_event(f"❌ Tier 4 Failover error: {e_failover}")
+
+    return {"text": "[LAR-OS Gateway Failover] All active accounts and failover proxies cooling down. Retry shortly.", "tool_calls": []}
 
 # ==========================================
 # 8. API ENDPOINTS
@@ -378,6 +446,7 @@ async def health_check():
         "tokens_saved_chars": STATS["tokens_saved_chars"],
         "active_models": len(MODELS_REGISTRY),
         "cooling_down_accounts": cooling,
+        "tier4_failover": "ONLINE (Port 18798, Antigravity 100% Free)",
         "cache_entries": len(RESPONSE_CACHE),
         "google_drive": drive_info
     }

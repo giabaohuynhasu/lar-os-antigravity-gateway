@@ -1,0 +1,127 @@
+{
+  "openapi": "3.1.0",
+  "info": {
+    "title": "Antigravity Autonomous Operating System API",
+    "description": "Connects ChatGPT mobile/web to Gia Bao Huynh's Antigravity Autonomous Engine (5-Pro Key Quota Pool, Opera Neon Claude/ChatGPT, and Gmail Dispatcher).",
+    "version": "3.5.0"
+  },
+  "servers": [
+    {
+      "url": "https://wrestling-chelsea-dude-symbol.trycloudflare.com",
+      "description": "Antigravity Cloudflare Secure Tunnel"
+    }
+  ],
+  "paths": {
+    "/v1/chat/completions": {
+      "post": {
+        "summary": "Execute Prompt with Antigravity AI Engine",
+        "description": "Dispatches prompt to Antigravity 5-Pro Quota Pool, Claude Sonnet 5 Max, or ChatGPT on Opera Neon. Optionally sends HTML report to user's Gmail.",
+        "operationId": "askAntigravity",
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "properties": {
+                  "model": {
+                    "type": "string",
+                    "enum": [
+                      "gemini-3.5-flash",
+                      "gemini-3.5-pro",
+                      "claude",
+                      "chatgpt"
+                    ],
+                    "default": "gemini-3.5-flash",
+                    "description": "Model engine to process the request."
+                  },
+                  "messages": {
+                    "type": "array",
+                    "items": {
+                      "type": "object",
+                      "properties": {
+                        "role": {
+                          "type": "string",
+                          "enum": [
+                            "user",
+                            "system",
+                            "assistant"
+                          ]
+                        },
+                        "content": {
+                          "type": "string"
+                        }
+                      },
+                      "required": [
+                        "role",
+                        "content"
+                      ]
+                    },
+                    "description": "Chat messages history or prompt."
+                  },
+                  "send_email": {
+                    "type": "boolean",
+                    "default": false,
+                    "description": "If true, automatically formats and dispatches an HTML report to thuaquan228@gmail.com."
+                  }
+                },
+                "required": [
+                  "messages"
+                ]
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Execution successful",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "choices": {
+                      "type": "array",
+                      "items": {
+                        "type": "object",
+                        "properties": {
+                          "message": {
+                            "type": "object",
+                            "properties": {
+                              "content": {
+                                "type": "string"
+                              }
+                            }
+                          }
+                        }
+                      }
+                    }
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/health": {
+      "get": {
+        "summary": "Check Antigravity System Health",
+        "description": "Returns health status of Gateway, 5 Google Pro Keys, Opera Neon, and Drive Bridge.",
+        "operationId": "checkSystemHealth",
+        "responses": {
+          "200": {
+            "description": "System health payload",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object"
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+  }
+}
