@@ -26,8 +26,10 @@ sys.path.insert(0, str(GATEWAY_DIR))
 
 from gemini_spark_bridge import GeminiSparkBridge
 from gmail_spark_sender import GmailSparkSender
+from vibe_interpreter import interpret_vibe, VibeResult
 
 GATEWAY_URL = "http://127.0.0.1:18797"
+
 RECIPIENT_EMAIL = "thuaquan228@gmail.com"
 
 # Terminal Color Codes
@@ -196,54 +198,129 @@ async def run_prompt_workflow(prompt: str, model: str, send_email: bool):
         res = await sender.send_report_email(subject, html_report, recipient=RECIPIENT_EMAIL)
         print(f"{Colors.GREEN}[✓] Báo cáo đã gửi thành công tới Gmail: {RECIPIENT_EMAIL}!{Colors.RESET}")
 
-async def interactive_mode(model: str, send_email: bool):
+async def interactive_mode(default_model: str = "gemini-3.5-flash", default_email: bool = False):
     print_banner()
-    print(f"{Colors.BOLD}Chế độ hội thoại tương tác trực tiếp (Gõ 'exit' hoặc 'quit' để thoát){Colors.RESET}")
-    print(f"Model: {Colors.YELLOW}{model}{Colors.RESET} | Auto-Email: {Colors.CYAN}{send_email}{Colors.RESET}\n")
+    print(f"{Colors.BOLD}✨ Chế độ Vibe Chat tương tác trực tiếp cho Termius & Terminal{Colors.RESET}")
+    print(f"{Colors.DIM}Gõ tự nhiên không cần cú pháp. Nhập 'exit', 'q' để thoát. Nhập 'st' để xem trạng thái.{Colors.RESET}")
+    print(f"Mô hình gốc: {Colors.YELLOW}{default_model}{Colors.RESET} | Auto-Email: {Colors.CYAN}{default_email}{Colors.RESET}\n")
+
+    current_model = default_model
+    current_email = default_email
 
     while True:
         try:
-            user_input = input(f"{Colors.GREEN}agy> {Colors.RESET}").strip()
+            user_input = input(f"{Colors.GREEN}vibe> {Colors.RESET}").strip()
             if not user_input:
                 continue
             if user_input.lower() in ("exit", "quit", "q"):
-                print(f"{Colors.DIM}Tạm biệt!{Colors.RESET}")
+                print(f"{Colors.DIM}Tạm biệt! Hẹn gặp lại trên Termius/Antigravity.{Colors.RESET}")
                 break
-            await run_prompt_workflow(user_input, model, send_email)
+
+            # Run through vibe interpreter
+            vibe = interpret_vibe(user_input.split())
+            if vibe.action == "status":
+                show_status()
+                continue
+            elif vibe.action == "inbox":
+                print(f"{Colors.CYAN}[+] Kiểm tra Gemini Spark Drive Inbox...{Colors.RESET}")
+                bridge = GeminiSparkBridge()
+                cmd = bridge.read_pending_command()
+                if not cmd:
+                    print(f"{Colors.GREEN}[✓] Hộp thư Drive trống, không có lệnh tồn đọng.{Colors.RESET}")
+                else:
+                    print(f"{Colors.YELLOW}[!] Tìm thấy lệnh: {cmd['id']}{Colors.RESET}")
+                    await run_prompt_workflow(cmd["prompt"], vibe.model, send_email=True)
+                    bridge.consume_command(cmd["id"], cmd["prompt"])
+                continue
+            
+            # Query action
+            target_model = vibe.model if vibe.model != "gemini-3.5-flash" else current_model
+            target_email = vibe.send_email or current_email
+
+            if vibe.vibe_notes:
+                print(f"{Colors.MAGENTA}✨ [VIBE]{Colors.RESET} {Colors.DIM}" + " • ".join(vibe.vibe_notes) + f"{Colors.RESET}")
+
+            await run_prompt_workflow(vibe.prompt, target_model, target_email)
+
         except (KeyboardInterrupt, EOFError):
             print("\nExiting...")
             break
 
+def has_stdin_data() -> bool:
+    """Checks if there is data waiting on stdin without blocking (Windows-safe)."""
+    if sys.stdin is None or sys.stdin.isatty():
+        return False
+    if sys.platform == "win32":
+        try:
+            import msvcrt
+            import ctypes
+            from ctypes import wintypes
+            handle = msvcrt.get_osfhandle(sys.stdin.fileno())
+            avail = wintypes.DWORD()
+            res = ctypes.windll.kernel32.PeekNamedPipe(
+                wintypes.HANDLE(handle), None, 0, None, ctypes.byref(avail), None
+            )
+            return bool(res and avail.value > 0)
+        except Exception:
+            return False
+    return False
+
 def main():
-    parser = argparse.ArgumentParser(
-        prog="agy",
-        description="Antigravity CLI (agy) - Điều khiển AI Agentic, Quota Pooling, và Báo Cáo Tự Động.",
-        formatter_class=argparse.RawDescriptionHelpFormatter,
-        epilog="""
-Ví dụ sử dụng:
-  agy "Tóm tắt tình hình các bài tập ASU POS 110"
-  agy --email "Nghiên cứu mô hình Queueing Instability và gửi báo cáo"
-  agy -m claude "Kiểm tra mã nguồn và tối ưu hóa"
-  agy status
-  cat prompt.txt | agy --email
-        """
-    )
+    raw_args = sys.argv[1:]
 
-    parser.add_argument("prompt", nargs="*", help="Nội dung prompt hoặc lệnh cần Antigravity thực thi.")
-    parser.add_argument("-m", "--model", default="gemini-3.5-flash", choices=["gemini-3.5-flash", "gemini-3.5-pro", "claude", "chatgpt"], help="Mô hình AI cần sử dụng (mặc định: gemini-3.5-flash qua 5-Pro Pool).")
-    parser.add_argument("-e", "--email", action="store_true", help="Tự động phát gửi báo cáo chi tiết về hộp thư thuaquan228@gmail.com qua Gmail.")
-    parser.add_argument("-s", "--status", action="store_true", help="Kiểm tra trạng thái toàn diện của Gateway, Opera Neon, và Drive Sync.")
-    parser.add_argument("-i", "--inbox", action="store_true", help="Kiểm tra và kích hoạt ngay các lệnh đang chờ trong Gemini Spark Drive Inbox.")
+    # Help flag check
+    if any(h in raw_args for h in ("-h", "--help", "help")):
+        parser = argparse.ArgumentParser(
+            prog="agy / a / vibe",
+            description="Antigravity CLI (agy / a / vibe) - Vibe Coding AI Operator cho Termius & Terminal.",
+            formatter_class=argparse.RawDescriptionHelpFormatter,
+            epilog="""
+Ví dụ Vibe Coding (Termius không cần ngoặc kép, không cần cờ):
+  a st
+  a khoe ko
+  a claude sua loi sql injection giup tui
+  vibe gpt giai thich co che consensus
+  a tom tat asu roi gui mail cho tui
+  a co gi moi
+  vibe
+            """
+        )
+        parser.add_argument("prompt", nargs="*", help="Lệnh hoặc câu hỏi cần AI xử lý.")
+        parser.add_argument("-m", "--model", default="gemini-3.5-flash", choices=["gemini-3.5-flash", "gemini-3.5-pro", "claude", "chatgpt"])
+        parser.add_argument("-e", "--email", action="store_true")
+        parser.add_argument("-s", "--status", action="store_true")
+        parser.add_argument("-i", "--inbox", action="store_true")
+        parser.print_help()
+        return
 
-    args = parser.parse_args()
+    # Check for stdin (piping support)
+    piped_text = ""
+    if has_stdin_data():
+        try:
+            piped_text = sys.stdin.read().strip()
+        except Exception:
+            pass
 
-    # Case 1: Status command
-    if args.status:
+    # Run Vibe Interpreter
+    vibe = interpret_vibe(raw_args)
+
+
+    # Attach piped text if present
+    if piped_text:
+        if vibe.prompt:
+            vibe.prompt = f"{vibe.prompt}\n\n[Dữ liệu đính kèm]:\n{piped_text}"
+        else:
+            vibe.prompt = piped_text
+        if vibe.action in ("interactive", "status", "inbox") and piped_text:
+            vibe.action = "query"
+
+    # Action 1: Status
+    if vibe.action == "status":
         show_status()
         return
 
-    # Case 2: Process Inbox command
-    if args.inbox:
+    # Action 2: Inbox check
+    if vibe.action == "inbox":
         print_banner()
         print(f"{Colors.CYAN}[+] Kiểm tra Gemini Spark Drive Inbox...{Colors.RESET}")
         bridge = GeminiSparkBridge()
@@ -252,22 +329,21 @@ Ví dụ sử dụng:
             print(f"{Colors.GREEN}[✓] Hộp thư Drive trống, không có lệnh tồn đọng.{Colors.RESET}")
         else:
             print(f"{Colors.YELLOW}[!] Tìm thấy lệnh: {cmd['id']}{Colors.RESET}")
-            asyncio.run(run_prompt_workflow(cmd["prompt"], args.model, send_email=True))
+            asyncio.run(run_prompt_workflow(cmd["prompt"], vibe.model, send_email=True))
             bridge.consume_command(cmd["id"], cmd["prompt"])
         return
 
-    # Check for stdin (piping support)
-    prompt_text = " ".join(args.prompt).strip()
-    if not prompt_text and not sys.stdin.isatty():
-        prompt_text = sys.stdin.read().strip()
-
-    # Case 3: Interactive mode if no prompt provided
-    if not prompt_text:
-        asyncio.run(interactive_mode(args.model, args.email))
+    # Action 3: Interactive mode
+    if vibe.action == "interactive":
+        asyncio.run(interactive_mode(vibe.model, vibe.send_email))
         return
 
-    # Case 4: Execute prompt
-    asyncio.run(run_prompt_workflow(prompt_text, args.model, args.email))
+    # Action 4: Query workflow
+    if vibe.vibe_notes:
+        print(f"{Colors.MAGENTA}{Colors.BOLD}✨ [VIBE INTERPRETER]{Colors.RESET} {Colors.DIM}" + " • ".join(vibe.vibe_notes) + f"{Colors.RESET}")
+
+    asyncio.run(run_prompt_workflow(vibe.prompt, vibe.model, vibe.send_email))
+
 
 if __name__ == "__main__":
     main()
