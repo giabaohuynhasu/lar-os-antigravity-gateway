@@ -19,7 +19,14 @@ import urllib.request
 import urllib.parse
 from typing import List, Dict, Any, Optional
 
+try:
+    if hasattr(sys.stdout, "reconfigure"):
+        sys.stdout.reconfigure(encoding="utf-8")
+except Exception:
+    pass
+
 GATEWAY_LAN_URL = os.environ.get("AGY_GATEWAY_URL", "http://192.168.1.223:18797")
+GATEWAY_TUNNEL_URL = os.environ.get("AGY_TUNNEL_URL", "https://wrestling-chelsea-dude-symbol.trycloudflare.com")
 FALLBACK_API_KEY = os.environ.get("GEMINI_API_KEY", "")
 RECIPIENT_EMAIL = "thuaquan228@gmail.com"
 
@@ -143,13 +150,26 @@ def show_status():
     except Exception:
         gw_online = False
 
+    # 2. Check Gateway Tunnel (4G/5G)
+    tunnel_online = False
+    try:
+        req = urllib.request.Request(f"{GATEWAY_TUNNEL_URL}/health")
+        with urllib.request.urlopen(req, timeout=3) as resp:
+            data = json.loads(resp.read().decode())
+            tunnel_online = data.get("status") == "ONLINE"
+    except Exception:
+        tunnel_online = False
+
     if gw_online:
         print(f"[{Colors.GREEN}●{Colors.RESET}] {Colors.BOLD}LAR-OS Gateway (PC LAN):{Colors.RESET} {Colors.GREEN}ONLINE{Colors.RESET} ({GATEWAY_LAN_URL})")
-        print(f"    - Quota Mode: 5-Pro Key Quota Pool")
-        print(f"    - Auto-Email Dispatch: Opera Neon Gmail CDP Sẵn Sàng")
     else:
-        print(f"[{Colors.YELLOW}○{Colors.RESET}] {Colors.BOLD}LAR-OS Gateway (PC LAN):{Colors.RESET} {Colors.YELLOW}STANDBY / 4G MODE{Colors.RESET}")
-        print(f"    (Đang ở chế độ Direct Cloud Quota Pool)")
+        print(f"[{Colors.YELLOW}○{Colors.RESET}] {Colors.BOLD}LAR-OS Gateway (PC LAN):{Colors.RESET} {Colors.YELLOW}OFFLINE / NGOÀI PHỦ SÓNG WI-FI{Colors.RESET}")
+
+    if tunnel_online:
+        print(f"[{Colors.GREEN}●{Colors.RESET}] {Colors.BOLD}Global Cloudflare Tunnel (4G/5G / Custom GPT):{Colors.RESET} {Colors.GREEN}ONLINE{Colors.RESET}")
+        print(f"    - Endpoint: {GATEWAY_TUNNEL_URL}")
+    else:
+        print(f"[{Colors.YELLOW}○{Colors.RESET}] {Colors.BOLD}Global Cloudflare Tunnel:{Colors.RESET} {Colors.YELLOW}STANDBY{Colors.RESET}")
 
     print(f"[{Colors.GREEN}●{Colors.RESET}] {Colors.BOLD}Direct Gemini API Engine:{Colors.RESET} {Colors.GREEN}READY{Colors.RESET}")
     print(f"[{Colors.GREEN}●{Colors.RESET}] {Colors.BOLD}Target Mailbox:{Colors.RESET} {RECIPIENT_EMAIL}")
@@ -176,25 +196,32 @@ def query_gemini_direct(prompt: str, model: str = "gemini-2.5-flash") -> str:
         res = json.loads(resp.read().decode("utf-8"))
         return res["candidates"][0]["content"]["parts"][0]["text"]
 
-def query_gateway(prompt: str, model: str, send_email: bool = False) -> Optional[str]:
-    """Queries through the PC Gateway with auto email dispatch."""
-    try:
-        url = f"{GATEWAY_LAN_URL}/v1/chat/completions"
-        payload = {
-            "model": model,
-            "messages": [{"role": "user", "content": prompt}],
-            "email": send_email
-        }
-        req = urllib.request.Request(
-            url,
-            data=json.dumps(payload).encode("utf-8"),
-            headers={"Content-Type": "application/json"}
-        )
-        with urllib.request.urlopen(req, timeout=25) as resp:
-            res = json.loads(resp.read().decode("utf-8"))
-            return res["choices"][0]["message"]["content"]
-    except Exception:
-        return None
+def query_gateway(prompt: str, model: str, send_email: bool = False):
+    """Queries through PC Gateway via LAN first, then Tunnel (for 4G/5G)."""
+    endpoints = [
+        (GATEWAY_LAN_URL, "PC LAN Gateway"),
+        (GATEWAY_TUNNEL_URL, "Global Cloudflare Tunnel (4G/5G)")
+    ]
+    payload = {
+        "model": model,
+        "messages": [{"role": "user", "content": prompt}],
+        "send_email": send_email
+    }
+    data = json.dumps(payload).encode("utf-8")
+    for base_url, label in endpoints:
+        try:
+            url = f"{base_url}/v1/chat/completions"
+            req = urllib.request.Request(
+                url,
+                data=data,
+                headers={"Content-Type": "application/json"}
+            )
+            with urllib.request.urlopen(req, timeout=15) as resp:
+                res = json.loads(resp.read().decode("utf-8"))
+                return res["choices"][0]["message"]["content"], label
+        except Exception:
+            continue
+    return None, "None"
 
 def main():
     vibe = parse_vibe(sys.argv[1:])
@@ -227,9 +254,8 @@ def main():
 
     start_time = time.time()
     
-    # Try gateway first (handles 5-Pro Quota Pool + Opera Neon + Gmail Dispatch)
-    response = query_gateway(prompt, model, send_email=send_email)
-    mode_used = "PC Gateway Quota Pool"
+    # Try gateway first (LAN -> Tunnel -> Direct Gemini)
+    response, mode_used = query_gateway(prompt, model, send_email=send_email)
     if not response:
         response = query_gemini_direct(prompt, model)
         mode_used = "Direct Cloud Quota"
@@ -241,10 +267,10 @@ def main():
     print(f"\n{Colors.DIM}" + "-"*45 + f"{Colors.RESET}\n")
 
     if send_email:
-        if mode_used == "PC Gateway Quota Pool":
+        if "Gateway" in mode_used or "Tunnel" in mode_used:
             print(f"{Colors.GREEN}[✓] Đã gửi báo cáo chi tiết về Gmail: {RECIPIENT_EMAIL}!{Colors.RESET}")
         else:
-            print(f"{Colors.YELLOW}[!] Bạn đang chạy ở chế độ Direct Cloud (ngoài mạng LAN). Kết quả đã hiển thị trên màn hình.{Colors.RESET}")
+            print(f"{Colors.YELLOW}[!] Bạn đang chạy ở chế độ Direct Cloud. Kết quả đã hiển thị trên màn hình.{Colors.RESET}")
 
 if __name__ == "__main__":
     main()
