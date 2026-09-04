@@ -1,0 +1,1180 @@
+Đã đọc kỹ cả hai file. Với code hiện tại, mình nghĩ đã đủ để chốt kiến trúc Nuclear Event mà chưa cần thêm file ngay. Và có một phát hiện khá quan trọng:
+
+anti_crash_guard.py hiện tại chưa phải watchdog. Nó là audit tool.
+Nó không thể phát hiện chính process Gateway chết, vì chính nó không duy trì một quan hệ giám sát sống liên tục với Gateway.
+
+Mình sẽ thiết kế Nuclear Event theo hướng “monitor the monitor”: Gateway không được tự làm watchdog cho chính nó; một process độc lập sống bên ngoài Gateway sẽ là người có quyền tuyên bố Gateway đã chết.
+
+1. Kiến trúc mình chốt
+                    ┌──────────────────────────┐
+                    │   Windows 11 / Host      │
+                    │                          │
+                    │  ┌────────────────────┐  │
+                    │  │ LAR-OS Gateway     │  │
+                    │  │ PID = G             │  │
+                    │  │                    │  │
+                    │  │ heartbeat mỗi 5s  │──┼──────┐
+                    │  │ faulthandler      │  │      │
+                    │  │ excepthook         │  │      │
+                    │  └────────────────────┘  │      │
+                    │                          │      ▼
+                    │  ┌────────────────────┐  │  heartbeat.json
+                    │  │ Nuclear Watcher    │◄─┤  crash/latest.txt
+                    │  │ PID = W            │  │
+                    │  │                    │  │
+                    │  │ PID check          │  │
+                    │  │ heartbeat check    │  │
+                    │  │ incident state     │  │
+                    │  │ forensic collector │  │
+                    │  └─────────┬──────────┘  │
+                    │            │             │
+                    └────────────┼─────────────┘
+                                 │
+                     NUCLEAR EVENT detected
+                                 │
+                    ┌────────────▼────────────┐
+                    │  Independent SOS path   │
+                    │                          │
+                    │ gmail_spark_sender.py   │
+                    │        ↓                 │
+                    │ Opera Neon CDP :9224    │
+                    │        ↓                 │
+                    │ Gmail                    │
+                    │        ↓                 │
+                    │ Spark mobile push        │
+                    └──────────────────────────┘
+
+Đây chính xác là pattern được dùng rộng rãi: external supervisor + heartbeat + incident hysteresis/deduplication. Các watchdog tự host hiện nay cũng dùng process monitoring, heartbeat và failure threshold để tránh false positive/spam. 
+GitHub
++1
+
+Và Windows bản thân nó cũng có một tầng supervisor mạnh hơn nữa: Service Control Manager (SCM). Nếu Gateway được chạy như Windows Service, SCM có thể restart process khi nó terminate bất thường và thực hiện failure actions độc lập với process bị chết. 
+Microsoft Learn
++1
+
+2. anti_crash_guard.py hiện tại nên biến thành gì?
+
+File hiện tại:
+
+Python
+Chạy
+run_audit()
+
+chỉ làm:
+
+clean scratch
+      ↓
+GET /health
+      ↓
+disk usage
+      ↓
+print
+      ↓
+exit
+
+Nó không có:
+
+persistent monitoring
+
+PID ownership
+
+heartbeat
+
+incident state
+
+deduplication
+
+crash forensic
+
+SOS
+
+recovery
+
+detection khi chính Gateway bị freeze.
+
+Vì vậy mình không sửa nó thành một file khổng lồ.
+
+Tách thành:
+
+anti_crash_guard.py
+    ↓
+giữ chức năng audit thủ công
+
+lar_os_nuclear_watcher.py
+    ↓
+watchdog daemon độc lập
+
+lar_os_nuclear_state.json
+    ↓
+incident persistence
+
+heartbeat.json
+    ↓
+Gateway → Watcher
+
+crash/latest.txt
+    ↓
+Gateway forensic output
+
+Sau đó nếu muốn tối ưu RAM tuyệt đối, bước cuối có thể compile watcher thành:
+
+lar-os-nuclear-watcher.exe
+
+bằng Go.
+
+Mình nghiêng về Go cho watcher production
+
+Vì Gateway đã có CLIProxyAPI Go rồi.
+
+Một Go watcher cực nhỏ có thể:
+
+PID check
+
+file stat
+
+heartbeat timestamp
+
+incident state
+
+process launch
+
+gọi PowerShell
+
+HTTP/CDP bridge
+
+mà không phải giữ thêm một Python interpreter thường trực.
+
+Python watcher vẫn hoàn toàn khả thi để prototype.
+
+3. Heartbeat phải là atomic file
+
+Gateway cứ 5 giây ghi:
+
+heartbeat.json
+
+Ví dụ:
+
+JSON
+{
+  "pid": 18344,
+  "ts": 1788612345,
+  "state": "SERVING",
+  "last_provider": "gemini-3.1-flash-lite",
+  "active_routes": 5
+}
+
+Không ghi trực tiếp.
+
+Phải:
+
+heartbeat.tmp
+     ↓
+flush
+     ↓
+os.replace()
+     ↓
+heartbeat.json
+
+Vì watcher có thể đọc đúng lúc Gateway đang ghi.
+
+os.replace() cho ta semantics gần như:
+
+hoặc file cũ, hoặc file mới; không đọc một file JSON nửa chừng.
+
+4. Tại sao cần cả PID + heartbeat?
+
+Đây là điểm cực kỳ quan trọng.
+
+Case A — Gateway chết thật
+Gateway PID 18344
+        ↓
+taskkill /F
+        ↓
+PID gone
+        ↓
+Watcher → NUCLEAR
+
+Không cần đợi 30 giây.
+
+Process death = immediate Nuclear.
+
+Case B — asyncio event loop freeze
+
+Process vẫn tồn tại:
+
+PID 18344 = alive
+
+nhưng:
+
+heartbeat:
+12:00:00
+12:00:05
+12:00:10
+12:00:15
+...
+
+đột nhiên dừng.
+
+Watcher:
+
+PID alive
+heartbeat age = 31s
+
+=> Gateway HUNG.
+
+Đây là lý do PID check một mình không đủ.
+
+Các hệ thống watchdog thực tế cũng phân biệt process còn tồn tại với process còn phản hồi heartbeat; đây là pattern phổ biến của process watchdog. 
+GitHub
+
+5. Tôi sẽ dùng ngưỡng chính xác này
+Gateway heartbeat
+interval = 5s
+Watcher check
+interval = 10s
+Nuclear hang threshold
+heartbeat_age > 30s
+
+Tức là bình thường:
+
+heartbeat
+  0s
+  5s
+ 10s
+ 15s
+ 20s
+ 25s
+ 30s
+
+Nếu watcher thấy:
+
+age > 30s
+
+thì:
+
+NUCLEAR_EVENT = EVENT_LOOP_HANG
+
+Không cần HTTP /health để xác nhận.
+
+6. /health của Gateway vẫn giữ lại
+
+Nó trở thành L3 health, không phải L1 liveness.
+
+Ba tầng:
+
+L1 PROCESS
+    PID alive?
+
+L2 HEARTBEAT
+    event loop còn chạy?
+
+L3 SERVICE
+    /health còn trả lời?
+
+Ví dụ:
+
+PID	Heartbeat	/health	Kết luận
+alive	fresh	200	GREEN
+alive	fresh	timeout	DEGRADED
+alive	stale >30s	timeout	🔴 HANG
+dead	stale	timeout	🔴 PROCESS DEAD
+
+Điều này rất sạch.
+
+7. Crash forensic
+
+Trong Gateway, bật:
+
+Python
+Chạy
+faulthandler.enable(...)
+
+và:
+
+Python
+Chạy
+sys.excepthook = ...
+
+faulthandler đặc biệt hữu ích vì Python có thể dump traceback khi gặp các fatal signal; trên Windows nó cũng cài exception handler tương ứng. Python 3.14 còn hỗ trợ C-stack dumping trong các môi trường tương thích. 
+Python documentation
+
+File:
+
+crash/
+    latest.txt
+
+Ví dụ:
+
+============================================================
+LAR-OS CRASH REPORT
+============================================================
+
+TIME: 2026-09-05T00:31:22
+PID: 18344
+EXIT: UNKNOWN
+
+Traceback:
+  File "lar_os_gateway.py", line 1821, in route_request
+  File "asyncio/..."
+  ...
+
+Last known state:
+provider=CLIProxyAPI
+score=0
+hop=5
+request_id=...
+
+============================================================
+8. Nhưng có một giới hạn rất quan trọng
+
+sys.excepthook không phải detector.
+
+Nó chỉ bắt được một số loại exception.
+
+Nó không cứu được:
+
+taskkill /F
+
+hoặc:
+
+OOM termination
+
+hoặc:
+
+native segfault
+
+hoặc:
+
+power loss
+
+hoặc:
+
+Windows crash
+
+Trong các trường hợp này, external watcher mới là source of truth.
+
+Windows cũng có Windows Error Reporting cho application crash / no-response và có thể cấu hình LocalDumps để lưu user-mode dump độc lập với ứng dụng. 
+Microsoft Learn
++1
+
+Vì vậy:
+
+faulthandler
+      +
+excepthook
+      +
+Windows WER
+      +
+external watchdog
+
+mới tạo thành forensic stack đủ mạnh.
+
+9. Nuclear Event matrix
+
+Đây là matrix mình sẽ đóng băng thành specification.
+
+Event	SOS?	Delay
+Gemini #1 429	❌	—
+Gemini #2 429	❌	—
+Gemini #3 429	❌	—
+Gemini #4 429	❌	—
+Gemini #5 429	❌	—
+Tier-4 temporarily unavailable	❌	—
+CLIProxy restart	❌	—
+Neon unavailable	❌	—
+5 Gemini + Tier4 dead	⚠️	10s
+All routes dead >10s	🔴	immediate
+Gateway /health timeout	⚠️	—
+Gateway heartbeat stale 10s	⚠️	—
+Gateway heartbeat stale >30s	🔴	immediate
+Gateway PID unexpectedly dead	🔴	immediate
+taskkill /F	🔴	immediate
+native crash	🔴	immediate
+OOM kill	🔴	immediate*
+graceful shutdown	❌	—
+machine power loss	impossible locally	—
+
+* watcher chỉ biết sau khi máy/process trở lại; local watcher không thể gửi mail khi toàn bộ OS chết.
+
+Đây là một giới hạn vật lý chứ không phải thiếu code.
+
+10. Total route exhaustion phải có grace period
+
+Ví dụ:
+
+G1 dead
+G2 dead
+G3 dead
+G4 dead
+G5 dead
+Tier4 dead
+
+Không gửi ngay.
+
+Đặt:
+
+TOTAL_EXHAUSTION_GRACE = 10s
+
+Nếu trong 10 giây:
+
+G2 recovers
+
+=> reset.
+
+Nếu:
+
+t = 0   all dead
+t = 5   all dead
+t = 10  all dead
+
+=> Nuclear.
+
+Điều này tránh việc một burst 429 kéo theo một email đỏ.
+
+11. Deduplication
+
+Watcher phải có:
+
+incident_id
+incident_state
+last_alert_ts
+
+Ví dụ:
+
+NUC-20260905-003122-A7F4
+
+Khi incident bắt đầu:
+
+SEND SOS
+
+Watcher tiếp tục kiểm tra:
+
+10s
+20s
+30s
+40s
+...
+
+không gửi thêm email.
+
+Chỉ khi recovery:
+
+DEAD
+ ↓
+RECOVERED
+
+incident đóng.
+
+Nếu Gateway chết lần nữa:
+
+new incident ID
+new SOS
+Một incident = một SOS.
+
+Đây là nguyên tắc rất quan trọng. Các watchdog tự host hiện nay cũng dùng state-change alerting/rate limiting thay vì gửi thông báo ở mỗi lần check. 
+GitHub
++1
+
+12. Phần hay nhất: gmail_spark_sender.py
+
+Đây là chỗ mình phát hiện một vấn đề kiến trúc thật sự.
+
+Hiện tại:
+
+Python
+Chạy
+import websockets
+
+Nghĩa là file này không còn zero external dependency.
+
+websockets không phải Python stdlib.
+
+Với Gateway bình thường có thể chấp nhận.
+
+Nhưng với Nuclear path, mình không muốn:
+
+Gateway
+ ↓
+gmail_spark_sender
+ ↓
+websockets package
+
+vì nếu environment Python hỏng/dependency hỏng thì:
+
+Gateway chết → SOS sender cũng chết.
+
+Đó chính là failure cascade mà Nuclear Event được sinh ra để phá.
+
+13. Kiến trúc SOS đúng phải là
+Gateway
+   │
+   │ heartbeat
+   ▼
+Nuclear Watcher
+   │
+   │ independent
+   ▼
+SOS Launcher
+   │
+   ├── Opera Neon CDP 9224
+   │
+   └── Gmail
+         │
+         ▼
+       Spark
+
+Không:
+
+Gateway
+ └── SOS
+
+Mà:
+
+Watcher
+ └── SOS
+14. Nhưng Opera Neon lại là một dependency khác
+
+Nếu:
+
+Gateway chết
+
+nhưng:
+
+Opera Neon sống
+
+thì:
+
+Watcher
+ → CDP 9224
+ → Gmail
+ → Spark
+
+hoạt động.
+
+Nếu:
+
+Gateway chết
+Neon chết
+
+thì watcher phải thử:
+
+launch Neon
+ ↓
+wait for 9224
+ ↓
+open Gmail
+ ↓
+send SOS
+
+Đây là second-order recovery.
+
+15. Nhưng mình không khuyên Watcher tự embed toàn bộ Neon logic
+
+Tách:
+
+lar-os-nuclear-watcher
+        │
+        └── nuclear_sos_bridge
+                │
+                └── gmail_spark_sender
+
+Watcher chỉ quyết định:
+
+“Đã xảy ra Nuclear Event.”
+
+Nó không nên chứa hàng nghìn dòng browser automation.
+
+Lý do rất đơn giản:
+
+Watchdog càng đơn giản
+       ↓
+càng ít khả năng chính watchdog crash.
+16. gmail_spark_sender.py hiện tại cần sửa vài điểm trước production
+
+Có một bug rõ ràng:
+
+JavaScript
+sparkEmails.append(...)
+
+JavaScript Array không có .append().
+
+Phải:
+
+JavaScript
+sparkEmails.push(...)
+
+Nếu không scan_spark_emails() sẽ fail.
+
+Ngoài ra execute_cdp() đang:
+
+Python
+Chạy
+while time.time() - start < timeout:
+    await asyncio.wait_for(ws.recv(), timeout=timeout)
+
+Nó có thể khiến timeout bên trong recv() dài hơn timeout tổng mong muốn.
+
+Nuclear path nên có absolute deadline:
+
+deadline = monotonic() + 10s
+
+mỗi operation chỉ được sử dụng:
+
+remaining = deadline - monotonic()
+
+Đúng với triết lý Phase 7 của LAR-OS.
+
+17. SOS payload
+
+Mình sẽ làm nó cực kỳ mobile-first.
+
+Subject:
+
+🚨 [LAR-OS NUCLEAR EVENT] GATEWAY DOWN — IMMEDIATE ACTION
+
+Body:
+
+🚨 LAR-OS NUCLEAR EVENT
+
+STATUS: CRITICAL
+EVENT: PROCESS_DEAD
+INCIDENT: NUC-20260905-003122-A7F4
+
+Gateway:
+PID: 18344
+Last heartbeat: 31.4s ago
+Last state: ROUTING
+Last provider: CLIProxyAPI
+Hop: 5/5
+
+ROUTES
+G1 Gemini: DEAD
+G2 Gemini: DEAD
+G3 Gemini: DEAD
+G4 Gemini: DEAD
+G5 Gemini: DEAD
+Tier 4: DEAD
+Neon: ONLINE
+
+SYSTEM
+RAM: 35.2 MB
+CPU: 0.0%
+SQLite: 84 KB
+WAL: 0 KB
+
+LAST 8 FORENSIC LINES
+> timeout CLIProxyAPI
+> retry hop 3
+> retry hop 4
+> retry hop 5
+> Tier4 unavailable
+> all routes exhausted
+> heartbeat expired
+> PROCESS_DEAD
+
+━━━━━━━━━━━━━━━━━━━━
+🛟 RESCUE
+━━━━━━━━━━━━━━━━━━━━
+
+PowerShell:
+
+Restart-Service <LAR_OS_SERVICE>
+
+Termux / SSH:
+
+ssh <HOST> "powershell -NoProfile -Command Restart-Service <LAR_OS_SERVICE>"
+
+Incident:
+NUC-20260905-003122-A7F4
+
+Trên điện thoại, user chỉ cần đọc khoảng 5 giây là biết:
+
+cái gì chết → chết lúc nào → tại sao → hệ thống còn gì → chạy gì để cứu.
+
+18. “One-click” nên hiểu thế nào?
+
+Không nên để email tự động thực thi PowerShell. Đó là một boundary bảo mật không đáng phá.
+
+Thay vào đó:
+
+🛟 RESCUE
+
+PowerShell:
+Restart-Service LAR-OS
+
+hoặc tốt hơn:
+
+.\lar-os-recover.ps1
+
+Và nếu dùng SSH:
+
+ssh laros-host ".\lar-os-recover.ps1"
+
+User copy/paste một dòng.
+
+Nếu muốn thực sự one-click, có thể làm một recovery endpoint riêng được bảo vệ bằng SSH key / local authenticated mechanism. Mình sẽ không biến Gmail HTML thành remote-code-execution channel.
+
+19. Nuclear watcher phải có recovery loop
+
+Mình sẽ cho watcher thực hiện:
+
+NUCLEAR
+   ↓
+capture forensic snapshot
+   ↓
+send SOS
+   ↓
+attempt recovery
+   ↓
+wait 5s
+   ↓
+check Gateway
+   ↓
+if recovered:
+       close incident
+   ↓
+if dead:
+       bounded restart
+
+Nhưng:
+
+SOS trước, recovery sau.
+
+Không:
+
+restart
+ ↓
+restart
+ ↓
+restart
+ ↓
+restart
+ ↓
+SOS
+
+Vì nếu restart loop làm mất forensic state thì user nhận được một email vô dụng.
+
+20. Restart phải có backoff
+
+Ví dụ:
+
+attempt 1 → immediately
+attempt 2 → +5s
+attempt 3 → +15s
+attempt 4 → +30s
+
+Sau đó:
+
+RECOVERY_EXHAUSTED
+
+và không tiếp tục fork process vô hạn.
+
+Windows SCM cũng có cơ chế failure-count/reset-period/failure-action để tránh kiểu restart vô hạn không kiểm soát. 
+Microsoft Learn
++1
+
+21. Tôi còn muốn thêm một tầng: Windows SCM
+
+Nếu LAR-OS Gateway hiện có thể chạy dưới Windows Service, kiến trúc production đẹp nhất sẽ là:
+
+Windows SCM
+     │
+     ├────────────── Gateway
+     │
+     │
+Nuclear Watcher
+     │
+     ├── heartbeat
+     ├── forensic
+     └── SOS
+
+SCM chịu trách nhiệm:
+
+process restart
+
+Watcher chịu trách nhiệm:
+
+human notification + incident intelligence
+
+Đây là separation cực đẹp.
+
+SCM vốn được Windows thiết kế để quản lý lifecycle của services và có thể thực hiện SC_ACTION_RESTART hoặc chạy command khi service failure. 
+Microsoft Learn
++1
+
+Không nên bắt watcher làm cả job của SCM.
+
+22. Và đây là điểm rất quan trọng về “Antigravity crash”
+
+Cần phân biệt:
+
+Antigravity IDE chết
+
+với:
+
+LAR-OS Gateway chết
+
+Watcher không nên suy luận:
+
+“Antigravity không phản hồi → Gateway chết.”
+
+Thay vào đó:
+
+Antigravity
+      │
+      │ controls
+      ▼
+Gateway
+      │
+      ▼
+CLIProxy
+
+Nuclear Watcher giám sát Gateway PID + heartbeat.
+
+Sau đó có thể bổ sung:
+
+Neon PID/CDP
+Antigravity PID
+
+như secondary telemetry.
+
+Nhưng Gateway health không được phụ thuộc vào Antigravity.
+
+Nếu Antigravity chết mà Gateway vẫn:
+
+PID alive
+heartbeat fresh
+routes healthy
+
+=> không Nuclear.
+
+23. “What monitors the monitor?”
+
+Đây mới là Nuclear thật sự.
+
+Ta có:
+
+Gateway
+   ↑
+Watcher
+
+Nhưng nếu:
+
+Watcher chết
+
+thì sao?
+
+Đây là lý do mình muốn:
+
+Windows Task Scheduler / SCM
+             ↓
+      Nuclear Watcher
+             ↓
+          Gateway
+
+Tức là:
+
+Windows
+  ↓
+Watcher
+  ↓
+Gateway
+
+Ba tầng.
+
+Windows đã chạy SCM từ lúc boot và SCM quản lý lifecycle của services. 
+Microsoft Learn
+
+Nếu watcher là Windows Service thì:
+
+SCM
+  ↓
+watcher.exe
+  ↓
+gateway.exe
+
+đây là kiến trúc monitor-the-monitor hoàn chỉnh.
+
+24. RAM/CPU budget
+
+Mình sẽ giữ:
+
+Gateway
+
+~35 MB hiện tại.
+
+Nuclear watcher
+
+Nếu Python:
+
++ ~10–20 MB
+
+=> có thể vượt target 45 MB.
+
+Do đó:
+
+Production recommendation
+lar-os-nuclear-watcher.exe
+
+Go static binary, không runtime dependency.
+
+Nó chỉ:
+
+sleep 10s
+read heartbeat
+OpenProcess/PID check
+stat files
+
+=> CPU gần như bằng 0 khi idle.
+
+Đây cũng phù hợp với các watchdog self-hosted hiện nay: một số implementation dùng một binary Go duy nhất, process monitoring + heartbeat + SQLite và không cần Docker/Redis/Postgres. 
+GitHub
+
+25. Có một thứ mình KHÔNG muốn làm
+
+Không dùng:
+
+while True:
+    check()
+    time.sleep(1)
+
+với:
+
+1s
+
+Không cần.
+
+Ta có:
+
+watch interval = 10s
+heartbeat = 5s
+hang threshold = 30s
+
+Watcher chỉ cần:
+
+sleep 10s
+
+CPU idle gần zero.
+
+26. Không cần SaaS
+
+Mình hoàn toàn đồng ý với constraint này.
+
+Không:
+
+PagerDuty
+Dead Man's Snitch
+UptimeRobot
+ntfy cloud
+Prometheus
+Grafana
+Docker
+Redis
+
+SOS path:
+
+Windows
+ ↓
+Nuclear Watcher
+ ↓
+Opera Neon localhost CDP
+ ↓
+Gmail
+ ↓
+Spark
+
+Không cần server thứ ba.
+
+Một số dead-man's-switch implementation trên mạng dựa vào alert receiver bên ngoài hoặc monitoring hub; đó là useful pattern conceptually, nhưng LAR-OS có thể bỏ phần cloud/hub vì nó đã có một out-of-process local watcher. 
+GitHub
+
+27. Nuclear Event state machine
+
+Mình sẽ đóng băng thành:
+
+                    ┌──────────┐
+                    │  GREEN   │
+                    └────┬─────┘
+                         │
+              degradation/failures
+                         ▼
+                 ┌──────────────┐
+                 │   DEGRADED   │
+                 └──────┬───────┘
+                        │
+                all routes dead
+                        │
+                      10 sec
+                        ▼
+                 ┌──────────────┐
+                 │   NUCLEAR    │
+                 └──────┬───────┘
+                        │
+                  send exactly 1
+                       SOS
+                        │
+                        ▼
+                 ┌──────────────┐
+                 │  RECOVERING  │
+                 └──────┬───────┘
+                        │
+                 heartbeat fresh
+                        ▼
+                   ┌────────┐
+                   │ GREEN  │
+                   └────────┘
+
+Process death bypasses everything:
+
+PROCESS DEAD
+     │
+     ▼
+NUCLEAR
+
+Heartbeat hang cũng bypass:
+
+HEARTBEAT >30s
+     │
+     ▼
+NUCLEAR
+28. Nuclear invariants
+
+Mình đề nghị thêm các invariant này vào Phase 12:
+
+N1 Provider failure != Nuclear
+N2 Circuit OPEN != Nuclear
+N3 CLIProxy restart != Nuclear
+N4 Graceful Gateway shutdown != Nuclear
+
+N5 Unexpected Gateway death = Nuclear
+N6 Heartbeat stale >30s = Nuclear
+N7 Persistent total route exhaustion >10s = Nuclear
+
+N8 Watcher survives Gateway
+N9 SOS path survives Gateway
+N10 Watcher does not depend on Gateway HTTP
+N11 One incident produces exactly one SOS
+N12 Recovery creates no duplicate SOS
+
+N13 faulthandler is forensic, not liveness
+N14 heartbeat is liveness, not forensic
+N15 PID is process liveness, not application health
+
+N16 Nuclear path has bounded timeout
+N17 Nuclear path cannot block Gateway
+N18 Watcher has no busy loop
+N19 Watcher idle CPU ≈ 0%
+N20 Watcher + Gateway remain under RAM budget
+
+N21 Watcher failure is independently recoverable
+N22 Whole-machine death cannot be detected locally
+29. Và có một nâng cấp cực hay: heartbeat không chỉ là timestamp
+
+Mình sẽ cho Gateway ghi:
+
+JSON
+{
+  "pid": 18344,
+  "ts": 1788612345,
+  "boot_id": "GW-8F2A",
+  "state": "SERVING",
+  "request_id": "req-...",
+  "provider": "gemini-3.1-flash-lite",
+  "hop": 2,
+  "score_min": 72,
+  "cli_proxy": "UP",
+  "neon_cdp": "UP",
+  "ram_mb": 35.1,
+  "cpu_pct": 0.0,
+  "sqlite_bytes": 86016
+}
+
+Thế là khi Gateway chết, watcher không cần hỏi Gateway nữa.
+
+Nó chỉ đọc snapshot cuối cùng.
+
+Đây chính là thứ làm SOS trở thành:
+
+forensic snapshot
+
+thay vì:
+
+“Gateway chết lol.”
+
+30. Một điểm nữa: crash forensic nên giữ vòng nhỏ
+
+Không để:
+
+crash/latest.txt
+
+phình vô hạn.
+
+Dùng:
+
+crash/
+    latest.txt
+    previous.txt
+
+hoặc:
+
+latest.txt < 64 KB
+
+Watcher chỉ lấy:
+
+last 8 non-empty lines
+
+để gửi Spark.
+
+Full forensic vẫn nằm local.
+
+31. Kết luận kiến trúc cuối cùng
+
+Mình sẽ chốt Nuclear Event v1 như sau:
+
+                         WINDOWS SCM
+                              │
+                              ▼
+                 ┌────────────────────────┐
+                 │ Nuclear Watcher        │
+                 │ Go static binary       │
+                 │                        │
+                 │ PID monitor             │
+                 │ heartbeat monitor       │
+                 │ incident FSM            │
+                 │ dedup                   │
+                 │ forensic collector      │
+                 │ SOS launcher            │
+                 └───────────┬────────────┘
+                             │
+              ┌──────────────┴──────────────┐
+              ▼                             ▼
+      LAR-OS Gateway                  SOS Bridge
+              │                             │
+       heartbeat.json                 Neon CDP :9224
+       crash/latest.txt                     │
+       telemetry SQLite                     ▼
+              │                          Gmail
+              ▼                             │
+        Gemini ×5                         Spark
+              │
+           Tier 3
+              │
+       CLIProxyAPI
+              │
+           Tier 4
+
+Điểm cốt lõi nhất: anti_crash_guard.py không nên được biến thành “một Gateway thứ hai”. Nó nên trở thành audit utility; Nuclear Watcher phải là một process hoàn toàn độc lập. Gateway chết thì watcher vẫn sống; watcher chết thì Windows SCM/Task Scheduler kéo watcher lên lại.
+
+Và gmail_spark_sender.py phải được coi là Nuclear dependency, không phải Gateway dependency. Đặc biệt, code hiện tại còn dùng websockets và có bug .append(), nên mình sẽ sửa nó trước khi gọi đây là Nuclear-grade.
+
+Nếu triển khai đúng kiến trúc này, LAR-OS sẽ có một failure hierarchy rất đẹp:
+
+provider → circuit breaker → failover → Tier 4 → Gateway isolation → Nuclear watcher → Spark SOS → human recovery.
+
+Đó là một kiến trúc khá gần với cách các hệ thống production tách service recovery khỏi failure notification; Windows SCM cung cấp lớp recovery bên ngoài process, còn heartbeat/external watchdog xử lý cả trường hợp process còn sống nhưng đã mất khả năng hoạt động. 
+Microsoft Learn
++2
+Microsoft Learn
++2
+
+Bước code tiếp theo mình sẽ làm theo thứ tự: heartbeat/crash hooks trong lar_os_gateway.py → lar_os_nuclear_watcher → sửa gmail_spark_sender.py thành Nuclear-safe bridge → chaos tests cho taskkill /F, freeze event loop, process crash và total-route exhaustion.

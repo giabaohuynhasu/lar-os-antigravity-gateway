@@ -1,0 +1,818 @@
+Quá ổn. Với Phase 5–6 đã tách telemetry khỏi critical path, Phase 7 nên là lớp bảo vệ cuối cùng của request lifecycle, còn Phase 10 chỉ đọc snapshot + SQLite và tuyệt đối không được tham gia routing.
+
+Mình chốt thiết kế như sau.
+
+Phase 7 — Bounded Retry + Decorrelated Jitter
+
+Mục tiêu nên là:
+
+MAX_REQUEST_BUDGET = 25s
+MAX_HOPS            = 5
+MAX_RETRIES         = 4
+
+Điểm quan trọng: 25 giây là ngân sách toàn request, không phải 25 giây cho mỗi provider.
+
+1. Retry state machine
+Client request
+     │
+     ▼
+deadline = now + 25s
+     │
+     ▼
+rank eligible providers
+     │
+     ▼
+┌── attempt ──────────────────┐
+│                             │
+│ provider #1                 │
+│       │                     │
+│       ├── success ─────────► DONE
+│       │                     │
+│       └── retryable failure │
+│                │            │
+│                ▼            │
+│        circuit.record_fail  │
+│                │            │
+│        decorrelated jitter  │
+│                │            │
+│                ▼            │
+│          provider #2        │
+└─────────────────────────────┘
+                │
+                ▼
+          ... max 5 hops
+                │
+                ▼
+       Tier-4 / final fallback
+                │
+                ▼
+             DONE
+2. Decorrelated jitter
+
+Không nên dùng:
+
+Python
+Chạy
+delay = base * 2 ** attempt
+
+vì năm account cùng nhận 429 sẽ tạo synchronized retry.
+
+Dùng:
+
+Python
+Chạy
+sleep = min(cap, random.uniform(base, previous_sleep * 3))
+
+Ví dụ:
+
+Python
+Chạy
+import random
+
+
+def decorrelated_jitter(
+    previous_delay: float,
+    base: float = 0.25,
+    cap: float = 3.0,
+) -> float:
+    upper = max(base, previous_delay * 3.0)
+    return min(cap, random.uniform(base, upper))
+
+Sequence có thể thành:
+
+0.41s
+0.83s
+1.92s
+0.57s
+1.48s
+
+thay vì:
+
+0.5
+1
+2
+4
+8
+
+Như vậy năm account bị 429 sẽ không đồng loạt quay lại upstream cùng một thời điểm.
+
+3. Bounded retry loop
+
+Mình khuyên dùng deadline monotonic:
+
+Python
+Chạy
+import time
+
+
+REQUEST_BUDGET = 25.0
+MAX_HOPS = 5
+MAX_RETRIES = 4
+
+
+async def dispatch_with_retry(request):
+
+    deadline = time.monotonic() + REQUEST_BUDGET
+
+    previous_delay = 0.25
+    attempted = set()
+
+    for hop in range(MAX_HOPS):
+
+        remaining = deadline - time.monotonic()
+
+        if remaining <= 0:
+            break
+
+        provider = await router.select_next(
+            attempted=attempted
+        )
+
+        if provider is None:
+            break
+
+        attempted.add(provider.name)
+
+        # Circuit breaker remains the final authority.
+        if not await provider.circuit.allow_request():
+            continue
+
+        started = time.monotonic()
+
+        try:
+            result = await call_provider(
+                provider,
+                request,
+                timeout=remaining,
+            )
+
+            latency_ms = int(
+                (time.monotonic() - started) * 1000
+            )
+
+            await provider.circuit.record_success(
+                latency_ms
+            )
+
+            telemetry.emit(
+                kind=2,  # SUCCESS
+                provider=provider.id,
+                latency_ms=latency_ms,
+            )
+
+            return result
+
+        except RetryableError as exc:
+
+            latency_ms = int(
+                (time.monotonic() - started) * 1000
+            )
+
+            await provider.circuit.record_failure(
+                exc,
+                latency_ms,
+            )
+
+            telemetry.emit(
+                kind=3,
+                provider=provider.id,
+                latency_ms=latency_ms,
+            )
+
+            remaining = deadline - time.monotonic()
+
+            if remaining <= 0:
+                break
+
+            if hop >= MAX_RETRIES:
+                break
+
+            delay = decorrelated_jitter(
+                previous_delay
+            )
+
+            previous_delay = delay
+
+            # Never sleep beyond request deadline.
+            await asyncio.sleep(
+                min(delay, remaining)
+            )
+
+        except Exception:
+            # Non-retryable error.
+            raise
+
+    # All bounded hops exhausted.
+    return await dispatch_tier4(
+        request,
+        deadline=deadline,
+    )
+Nhưng có một chỉnh sửa quan trọng
+
+Tier-4 không nên có thêm một vòng retry độc lập.
+
+Nếu:
+
+Gemini #1
+Gemini #2
+Gemini #3
+Gemini #4
+Gemini #5
+
+đã tiêu hết budget, thì Tier-4 chỉ được thử trong phần budget còn lại.
+
+Ví dụ:
+
+0.0s ─────────────────────────── 25s
+│
+├─ Gemini #1  3.1s
+├─ jitter     0.4s
+├─ Gemini #2  4.0s
+├─ jitter     0.8s
+├─ Gemini #3  2.8s
+├─ jitter     0.7s
+├─ Gemini #4  5.0s
+│
+└─ Tier-4     remaining ~8.2s
+
+Như vậy hard upper bound của request vẫn là ~25s, thay vì:
+
+25s × số provider.
+
+Phase 7 — Retry classification
+
+Đừng retry mọi exception.
+
+Nên phân loại:
+
+Error	Retry?
+HTTP 429	✅
+timeout	✅
+connection reset	✅
+connection refused	✅
+HTTP 502	✅
+HTTP 503	✅
+HTTP 504	✅
+malformed request	❌
+authentication failure	❌
+invalid API key	❌
+unsupported model	❌
+programming exception	❌
+
+Điều này cực kỳ quan trọng để tránh:
+
+bug
+ ↓
+retry
+ ↓
+bug
+ ↓
+retry
+ ↓
+5 providers
+ ↓
+Tier-4
+ ↓
+25 seconds
+
+Một bug không nên biến thành một distributed self-DDoS.
+
+Phase 10 — Zero-framework Dashboard
+
+Phần này mình sẽ làm cực kỳ đơn giản:
+
+GET /dashboard
+        │
+        ▼
+HTMLResponse
+        │
+        ├── inline CSS
+        └── inline JS
+
+Không React.
+
+Không Vue.
+
+Không Chart.js.
+
+Không WebSocket.
+
+Không SSE.
+
+Browser chỉ:
+
+JavaScript
+fetch("/status")
+
+mỗi 4 giây khi tab visible.
+
+Khi:
+
+JavaScript
+document.hidden === true
+
+→ stop polling.
+
+Khi quay lại:
+
+JavaScript
+visibilitychange
+
+→ fetch ngay một lần rồi restart timer.
+
+Dashboard layout
+
+Mình đề xuất:
+
+┌──────────────────────────────────────────────────┐
+│ LAR-OS Unified Gateway             ● OPERATIONAL │
+│                                                  │
+│ ┌────────┐ ┌────────┐ ┌────────┐ ┌────────────┐ │
+│ │ 92.4   │ │ 1120ms │ │ 5/5    │ │ Tier-4     │ │
+│ │ Health │ │ EMA    │ │ Gemini │ │ Standby    │ │
+│ └────────┘ └────────┘ └────────┘ └────────────┘ │
+│                                                  │
+│ PROVIDERS                                        │
+│                                                  │
+│ Gemini-1   ████████████████  96.2   420ms  ●    │
+│ Gemini-2   ██████████████    88.4  1100ms  ●    │
+│ Gemini-3   ███████████       76.1  2200ms  ●    │
+│ Gemini-4   OPEN               -1          ×     │
+│ Gemini-5   ████████████       82.7  1700ms  ●    │
+│                                                  │
+│ WATCHDOG                                         │
+│ ● RUNNING                                        │
+│                                                  │
+│ RECENT TELEMETRY                                 │
+│ 23:19:12 SUCCESS Gemini-1  421ms                │
+│ 23:19:10 REQUEST Gemini-1                       │
+│ 23:19:07 FAIL    Gemini-4  429                 │
+│ ...                                              │
+└──────────────────────────────────────────────────┘
+
+Không cần chart library. Với 5 providers, horizontal bars bằng CSS đẹp hơn cả Chart.js mà gần như miễn phí.
+
+HTML mẫu
+
+Đây là skeleton mình khuyên Antigravity nhúng trực tiếp vào Python:
+
+Python
+Chạy
+from fastapi.responses import HTMLResponse
+
+
+DASHBOARD_HTML = r"""<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>LAR-OS Gateway</title>
+
+<style>
+:root{
+  color-scheme:dark;
+  --bg:#080b10;
+  --panel:#10151d;
+  --border:#202936;
+  --text:#e8edf3;
+  --muted:#7f8b99;
+  --good:#4ade80;
+  --warn:#fbbf24;
+  --bad:#f87171;
+  --accent:#60a5fa;
+}
+
+*{box-sizing:border-box}
+
+body{
+  margin:0;
+  background:var(--bg);
+  color:var(--text);
+  font:14px system-ui,-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;
+}
+
+main{
+  width:min(1100px,94vw);
+  margin:32px auto;
+}
+
+header{
+  display:flex;
+  justify-content:space-between;
+  align-items:center;
+  margin-bottom:24px;
+}
+
+h1{
+  font-size:22px;
+  margin:0;
+}
+
+.sub{
+  color:var(--muted);
+  margin-top:4px;
+}
+
+.grid{
+  display:grid;
+  grid-template-columns:repeat(4,1fr);
+  gap:12px;
+  margin-bottom:16px;
+}
+
+.card{
+  background:var(--panel);
+  border:1px solid var(--border);
+  border-radius:12px;
+  padding:16px;
+}
+
+.metric{
+  font-size:25px;
+  font-weight:700;
+}
+
+.label{
+  color:var(--muted);
+  font-size:12px;
+  margin-top:5px;
+}
+
+.dot{
+  display:inline-block;
+  width:8px;
+  height:8px;
+  border-radius:50%;
+  background:var(--good);
+  margin-right:6px;
+}
+
+.providers{
+  display:grid;
+  gap:10px;
+}
+
+.provider{
+  display:grid;
+  grid-template-columns:110px 1fr 70px 80px 70px;
+  gap:12px;
+  align-items:center;
+}
+
+.bar{
+  height:7px;
+  background:#1a222d;
+  border-radius:99px;
+  overflow:hidden;
+}
+
+.fill{
+  height:100%;
+  background:var(--accent);
+}
+
+.state{
+  font-size:12px;
+  color:var(--muted);
+}
+
+.events{
+  margin-top:16px;
+  font-family:ui-monospace,SFMono-Regular,Menlo,monospace;
+  font-size:12px;
+}
+
+.event{
+  display:grid;
+  grid-template-columns:80px 100px 100px 1fr;
+  padding:8px 0;
+  border-bottom:1px solid var(--border);
+}
+
+.good{color:var(--good)}
+.warn{color:var(--warn)}
+.bad{color:var(--bad)}
+
+@media(max-width:700px){
+  .grid{grid-template-columns:repeat(2,1fr)}
+  .provider{
+    grid-template-columns:80px 1fr 60px;
+  }
+  .provider .extra{display:none}
+}
+</style>
+</head>
+
+<body>
+<main>
+
+<header>
+<div>
+<h1>LAR-OS Unified Gateway</h1>
+<div class="sub">Adaptive AI routing telemetry</div>
+</div>
+<div id="overall"><span class="dot"></span>ONLINE</div>
+</header>
+
+<section class="grid">
+<div class="card">
+<div id="avgScore" class="metric">—</div>
+<div class="label">AVG HEALTH</div>
+</div>
+
+<div class="card">
+<div id="avgLatency" class="metric">—</div>
+<div class="label">LATENCY EMA</div>
+</div>
+
+<div class="card">
+<div id="providerCount" class="metric">—</div>
+<div class="label">ACTIVE PROVIDERS</div>
+</div>
+
+<div class="card">
+<div id="watchdog" class="metric">—</div>
+<div class="label">WATCHDOG</div>
+</div>
+</section>
+
+<div class="card">
+<h3>Providers</h3>
+<div id="providers" class="providers"></div>
+</div>
+
+<div class="card">
+<h3>Recent telemetry</h3>
+<div id="events" class="events"></div>
+</div>
+
+</main>
+
+<script>
+const $ = id => document.getElementById(id);
+let timer = null;
+
+function esc(v){
+  return String(v ?? "")
+    .replaceAll("&","&amp;")
+    .replaceAll("<","&lt;")
+    .replaceAll(">","&gt;");
+}
+
+function render(data){
+
+  const providers = data.providers || [];
+
+  const active = providers.filter(
+    p => Number(p.health_score) > 0
+  );
+
+  const scores = active.map(
+    p => Number(p.health_score)
+  );
+
+  const latencies = active
+    .map(p => Number(p.latency_ema))
+    .filter(Number.isFinite);
+
+  const avgScore = scores.length
+    ? scores.reduce((a,b)=>a+b,0)/scores.length
+    : 0;
+
+  const avgLatency = latencies.length
+    ? latencies.reduce((a,b)=>a+b,0)/latencies.length
+    : 0;
+
+  $("avgScore").textContent = avgScore.toFixed(1);
+  $("avgLatency").textContent =
+    avgLatency ? Math.round(avgLatency)+"ms" : "—";
+
+  $("providerCount").textContent =
+    active.length + "/" + providers.length;
+
+  $("watchdog").textContent =
+    data.watchdog?.running ? "RUNNING" : "STOPPED";
+
+  $("providers").innerHTML = providers.map(p => {
+
+    const score = Number(p.health_score);
+    const width = Math.max(
+      0,
+      Math.min(100, score)
+    );
+
+    const state = esc(p.state);
+
+    return `
+      <div class="provider">
+        <strong>${esc(p.name)}</strong>
+        <div class="bar">
+          <div class="fill"
+               style="width:${width}%"></div>
+        </div>
+        <strong>${score >= 0 ? score.toFixed(1) : "OPEN"}</strong>
+        <span class="extra">
+          ${Number.isFinite(Number(p.latency_ema))
+            ? Math.round(p.latency_ema)+"ms"
+            : "—"}
+        </span>
+        <span class="state">${state}</span>
+      </div>
+    `;
+  }).join("");
+
+  $("events").innerHTML =
+    (data.events || []).slice(0,20).map(e => `
+      <div class="event">
+        <span>${esc(e.time)}</span>
+        <span>${esc(e.kind)}</span>
+        <span>${esc(e.provider)}</span>
+        <span>${esc(e.latency_ms ?? "")}</span>
+      </div>
+    `).join("");
+}
+
+async function refresh(){
+
+  if(document.hidden) return;
+
+  try{
+    const r = await fetch(
+      "/status",
+      {
+        cache:"no-store",
+        headers:{"Accept":"application/json"}
+      }
+    );
+
+    if(!r.ok) throw new Error("status");
+
+    render(await r.json());
+
+  }catch(e){
+    $("overall").innerHTML =
+      '<span class="dot"></span>STATUS UNAVAILABLE';
+  }
+}
+
+function start(){
+  if(timer) return;
+
+  refresh();
+
+  timer = setInterval(
+    refresh,
+    4000
+  );
+}
+
+function stop(){
+  if(timer){
+    clearInterval(timer);
+    timer = null;
+  }
+}
+
+document.addEventListener(
+  "visibilitychange",
+  () => {
+    if(document.hidden) stop();
+    else start();
+  }
+);
+
+start();
+</script>
+
+</body>
+</html>
+"""
+
+Endpoint:
+
+Python
+Chạy
+@app.get(
+    "/dashboard",
+    response_class=HTMLResponse,
+)
+async def dashboard():
+    return HTMLResponse(DASHBOARD_HTML)
+/status nên trả JSON chứ không render HTML
+
+Ví dụ:
+
+Python
+Chạy
+@app.get("/status")
+async def status():
+
+    return {
+        "watchdog": {
+            "running": watchdog.is_running,
+        },
+
+        "providers": [
+            {
+                "name": p.name,
+                "health_score": p.health_score(),
+                "latency_ema": p.latency_ema,
+                "state": p.state.name,
+            }
+            for p in providers
+        ],
+
+        "events": telemetry.latest_events(20),
+    }
+
+Và đây là một kiến trúc rất sạch:
+
+/dashboard
+     │
+     └── static HTML/CSS/JS
+
+/status
+     │
+     ├── RAM health state
+     ├── Watchdog state
+     └── SQLite latest 20 events
+
+Dashboard không truy cập SQLite trực tiếp từ browser.
+
+Một invariant mình muốn giữ tuyệt đối
+Dashboard không được phép làm chậm Gateway.
+
+Do đó /status:
+
+không lock circuit breaker lâu;
+
+không gọi upstream;
+
+không chờ telemetry writer;
+
+không VACUUM;
+
+không checkpoint;
+
+không tính toán aggregate nặng;
+
+chỉ đọc state hiện tại + SELECT ... LIMIT 20.
+
+Và frontend:
+
+JavaScript
+if(document.hidden) return;
+
+kết hợp với visibilitychange nghĩa là mở 10 tab cũng chỉ tạo request khi các tab thực sự visible.
+
+Phase 7 + 10 khi ghép vào LAR-OS
+
+Mình sẽ coi request lifecycle hoàn chỉnh như:
+
+                 ┌─────────────────┐
+                 │ Client Request  │
+                 └────────┬────────┘
+                          ↓
+                   25s Deadline
+                          ↓
+                 Health Score Rank
+                          ↓
+                 Circuit Admission
+                          ↓
+                 Provider Attempt
+                    ↙           ↘
+                 success       retryable
+                   ↓               ↓
+                 EMA          record failure
+                   ↓               ↓
+              telemetry       jitter
+                   ↓               ↓
+                 DONE        next provider
+                                  │
+                            max 5 hops
+                                  │
+                                  ↓
+                           Tier-4 fallback
+                                  │
+                                  ↓
+                                DONE
+
+Còn dashboard nằm hoàn toàn ngoài critical path:
+
+                   LAR-OS
+                      │
+          ┌───────────┴───────────┐
+          ↓                       ↓
+    REQUEST PATH             OBSERVABILITY
+          │                       │
+    Router/Retry              SQLite WAL
+    Circuit/EMA                    │
+          │                       ↓
+      Upstream                 /status
+                                  │
+                                  ↓
+                              /dashboard
+
+Đây là cách mình sẽ triển khai để Phase 7 tăng resilience mà không biến retry thành nguồn cascading failure, còn Phase 10 tăng khả năng quan sát mà gần như không tạo thêm tải nền.
+
+Một lưu ý cuối: nếu mục tiêu là hard cap 25s, hãy truyền remaining xuống tận HTTP/CDP/CLIProxy call ở mỗi hop, thay vì chỉ kiểm tra deadline bên ngoài. Nếu underlying call có thể treo 60s thì retry loop phía trên vẫn không cứu được hard bound.

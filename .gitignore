@@ -25,5 +25,8 @@ TUNNEL_URL.txt
 cliproxyapi/
 *.png
 *.jpg
-*.log
 *.db*
+*.log
+heartbeat.*
+nuclear_state.json
+crash/

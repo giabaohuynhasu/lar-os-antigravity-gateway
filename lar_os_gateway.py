@@ -33,8 +33,34 @@ from dataclasses import dataclass, field
 from typing import Optional, List, Dict, Any, AsyncGenerator
 from pathlib import Path
 
+import faulthandler
+import traceback
+
 if sys.platform.startswith("win"):
     sys.stdout.reconfigure(encoding="utf-8")
+
+# Crash Forensics (Phase 12 Nuclear Event Protocol)
+CRASH_DIR = Path(__file__).resolve().parent / "crash"
+CRASH_DIR.mkdir(parents=True, exist_ok=True)
+CRASH_FILE = CRASH_DIR / "latest.txt"
+
+try:
+    _crash_fp = open(CRASH_FILE, "a", encoding="utf-8", buffering=1)
+    faulthandler.enable(file=_crash_fp, all_threads=True)
+except Exception:
+    pass
+
+def _laros_excepthook(exc_type, exc_val, exc_tb):
+    try:
+        with open(CRASH_FILE, "a", encoding="utf-8") as f:
+            f.write(f"\n[{time.strftime('%Y-%m-%d %H:%M:%S')}] UNHANDLED FATAL EXCEPTION in Gateway PID {os.getpid()}:\n")
+            traceback.print_exception(exc_type, exc_val, exc_tb, file=f)
+    except Exception:
+        pass
+    finally:
+        sys.__excepthook__(exc_type, exc_val, exc_tb)
+
+sys.excepthook = _laros_excepthook
 
 from fastapi import FastAPI, Request, Response, HTTPException
 from fastapi.responses import StreamingResponse, JSONResponse, HTMLResponse
@@ -858,17 +884,99 @@ app.add_middleware(
 
 cli_watchdog = CLIProxyWatchdog(executable=CLIPROXY_EXE, config=CLIPROXY_CONFIG)
 
+HEARTBEAT_PATH = CURRENT_DIR / "heartbeat.json"
+
+class GatewayHeartbeatEmitter:
+    """
+    Phase 12: Atomic Heartbeat Emitter for Nuclear Event Out-of-Band Watchdog.
+    Every 5 seconds, writes full forensic snapshot to .heartbeat.tmp then atomically
+    replaces heartbeat.json using os.replace().
+    """
+    def __init__(self, path: Path = HEARTBEAT_PATH, interval_sec: float = 5.0):
+        self.path = path
+        self.interval_sec = interval_sec
+        self.boot_id = f"GW-{str(uuid.uuid4())[:8].upper()}"
+        self._task: Optional[asyncio.Task] = None
+        self._stop_event = asyncio.Event()
+        self.last_provider_used: str = "INITIALIZING"
+        self.last_hop_count: int = 0
+
+    def record_activity(self, provider: str, hop: int = 0):
+        self.last_provider_used = provider
+        self.last_hop_count = hop
+
+    def write_snapshot(self, graceful: bool = False):
+        try:
+            db_stat = telemetry_store.snapshot() if "telemetry_store" in globals() else {}
+            payload = {
+                "pid": os.getpid(),
+                "ts": time.time(),
+                "boot_id": self.boot_id,
+                "state": "SHUTDOWN" if graceful else "SERVING",
+                "graceful": graceful,
+                "last_provider": self.last_provider_used,
+                "last_hop": self.last_hop_count,
+                "active_circuits": len(CIRCUITS) if "CIRCUITS" in globals() else 0,
+                "ram_mb": 35.0,
+                "cpu_pct": 0.0,
+                "sqlite_bytes": (db_stat.get("db_size_kb", 0) * 1024) if db_stat else 0,
+                "uptime_sec": int(time.time() - STATS.get("start_time", time.time()))
+            }
+            try:
+                import psutil
+                p = psutil.Process(os.getpid())
+                payload["ram_mb"] = round(p.memory_info().rss / (1024 * 1024), 1)
+                payload["cpu_pct"] = round(p.cpu_percent(interval=None), 1)
+            except Exception:
+                pass
+
+            tmp_path = self.path.with_suffix(".tmp")
+            with open(tmp_path, "w", encoding="utf-8") as f:
+                json.dump(payload, f, indent=2)
+                f.flush()
+                os.fsync(f.fileno())
+            os.replace(tmp_path, self.path)
+        except Exception:
+            pass
+
+    async def start(self):
+        self._stop_event.clear()
+        self._task = asyncio.create_task(self._run_loop(), name="gateway-heartbeat")
+        log_event(f"💓 GatewayHeartbeatEmitter online (Interval: {self.interval_sec}s, Boot: {self.boot_id})")
+
+    async def stop(self):
+        self._stop_event.set()
+        if self._task and not self._task.done():
+            self._task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await self._task
+        self.write_snapshot(graceful=True)
+        log_event("💓 GatewayHeartbeatEmitter stopped (Graceful shutdown sentinel recorded)")
+
+    async def _run_loop(self):
+        while not self._stop_event.is_set():
+            self.write_snapshot(graceful=False)
+            try:
+                await asyncio.wait_for(self._stop_event.wait(), timeout=self.interval_sec)
+                break
+            except asyncio.TimeoutError:
+                pass
+
+gateway_heartbeat = GatewayHeartbeatEmitter()
+
 @app.on_event("startup")
 async def on_startup():
     telemetry_store.start()
     await cli_watchdog.start()
-    log_event("🚀 LAR-OS Gateway v3.3 online. CLIProxyWatchdog & SQLite WAL Telemetry active.")
+    await gateway_heartbeat.start()
+    log_event("🚀 LAR-OS Gateway v3.5 online. CLIProxyWatchdog, Heartbeat Emitter & SQLite WAL Telemetry active.")
 
 @app.on_event("shutdown")
 async def on_shutdown():
+    await gateway_heartbeat.stop()
     await cli_watchdog.stop()
     telemetry_store.stop()
-    log_event("🛑 LAR-OS Gateway shutdown. CLIProxyWatchdog & SQLite Telemetry cleanly stopped.")
+    log_event("🛑 LAR-OS Gateway shutdown. Heartbeat sentinel recorded, CLIProxyWatchdog & SQLite Telemetry cleanly stopped.")
 
 MODELS_REGISTRY = [
     {"id": "gemini-3.5-flash-lite", "object": "model", "created": 1780000000, "owned_by": "google", "description": "Google Gemini 3.5 Flash-Lite (High throughput, 1M context, sub-agent loop)"},
@@ -1144,6 +1252,7 @@ async def execute_model_request(model: str, messages: List[Dict[str, Any]], tool
             acc = key_entry["account"]
             cb = get_circuit(acc)
             hop_count += 1
+            gateway_heartbeat.record_activity(acc, hop_count)
             t_start = time.monotonic()
             call_timeout = min(4.5, remaining)
             res_dict, call_exc = await _isolated_provider_call(
@@ -1213,6 +1322,7 @@ async def execute_model_request(model: str, messages: List[Dict[str, Any]], tool
     remaining_t4 = deadline - time.monotonic()
     if remaining_t4 > 1.5 and await t4_cb.allow_request():
         log_event(f"🛡️ Activating TIER 4 FAILOVER (CLIProxyAPI Antigravity, budget remaining: {remaining_t4:.1f}s)...")
+        gateway_heartbeat.record_activity("tier4_cliproxyapi", hop_count + 1)
         telemetry_store.emit(kind=TelemetryKind.FAILOVER, provider=0, value=6)
         t4_start = time.monotonic()
         t4_timeout = min(20.0, remaining_t4)

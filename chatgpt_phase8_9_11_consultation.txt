@@ -1,0 +1,651 @@
+Quá đẹp — với RAM ~35 MB, CPU idle 0%, DB 84 KB, LAR-OS đang còn khoảng đệm khá lớn so với invariant 45 MB. Ba phase còn lại mình sẽ thiết kế theo một nguyên tắc chung:
+
+Health check không được biến thành traffic; isolation không được biến thành bottleneck; chaos test phải chứng minh được request-path invariant 25s.
+
+1. Phase 8 — CLIProxy Deep Health Check
+
+Nên tách thành hai lớp hoàn toàn khác nhau:
+
+CLIProxy Health
+│
+├── L1 Process Liveness
+│     ├── PID còn sống?
+│     └── TCP 127.0.0.1:18798 có LISTEN?
+│
+└── L2 Upstream Liveness
+      └── Google credential có thực sự usable?
+L1 — Process liveness
+
+Đây là check rẻ nhất:
+
+Python
+Chạy
+import socket
+
+
+def tcp_listening(host="127.0.0.1", port=18798):
+    s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    s.settimeout(0.15)
+
+    try:
+        return s.connect_ex((host, port)) == 0
+    finally:
+        s.close()
+
+Không cần psutil.
+
+Với process, nếu watchdog đã giữ Popen/PID:
+
+Python
+Chạy
+def process_alive(proc):
+    return proc is not None and proc.poll() is None
+
+Như vậy:
+
+PID dead + port closed  → DEAD
+PID alive + port closed → UNHEALTHY
+PID alive + port open   → process layer OK
+
+Không nên coi port open là upstream healthy.
+
+L2 — Upstream liveness
+
+Đây mới là Deep Health.
+
+Không nên ping Google liên tục.
+
+Thay vào đó dùng event-triggered probe:
+
+Normal traffic
+     │
+     ├── successful Tier-4 request
+     │        ↓
+     │    credential proven alive
+     │
+     └── no request
+              ↓
+       NO background probe
+
+Nếu có dấu hiệu:
+
+401 / 403 / OAuth invalid
+       ↓
+mark UNKNOWN
+       ↓
+single deep probe
+       ↓
+success → HEALTHY
+failure → UNHEALTHY
+Quan trọng: đừng probe bằng một request nặng
+
+Nếu CLIProxy có endpoint health/local status mà không gọi upstream, dùng nó cho L1.
+
+Đối với OAuth, cách tốt nhất là tận dụng response của request thật:
+
+real request
+   │
+   ├── 2xx → OAuth proven usable
+   │
+   ├── 401/403 → credential suspect
+   │
+   └── timeout/5xx → upstream/network issue
+
+Như vậy request thật cũng chính là health probe.
+
+Đây là zero-extra-quota approach.
+
+Nếu bắt buộc phải probe OAuth
+
+Cho phép tối đa:
+
+1 probe / 60s
+
+và không probe đồng thời:
+
+Python
+Chạy
+import asyncio
+import time
+
+
+class DeepHealth:
+    def __init__(self):
+        self.last_probe = 0.0
+        self._lock = asyncio.Lock()
+
+    async def should_probe(self):
+        now = time.monotonic()
+
+        async with self._lock:
+            if now - self.last_probe < 60:
+                return False
+
+            self.last_probe = now
+            return True
+
+Nhưng mình vẫn ưu tiên:
+
+passive health > active OAuth probe.
+
+2. Phase 9 — Process Self-Isolation
+
+Đây là phase rất đáng làm.
+
+Mục tiêu không phải chỉ:
+
+“exception không crash Gateway”
+
+mà là:
+
+một provider failure không thể xuyên boundary sang provider khác hoặc làm hỏng event loop.
+
+Mình sẽ dựng boundary như sau:
+
+                         LAR-OS
+                           │
+              ┌────────────┴────────────┐
+              │                         │
+        Request Supervisor        Telemetry
+              │
+       ┌──────┼────────┬────────┐
+       ↓      ↓        ↓        ↓
+    Tier1   Gemini   Neon    CLIProxy
+    Cache   Pool     CDP       Go
+              │        │        │
+              X        X        X
+         isolated   isolated  isolated
+Golden Isolation Rules
+Rule 1 — Không để provider exception thoát request supervisor
+Python
+Chạy
+async def isolated_call(provider, request, timeout):
+
+    try:
+        return await asyncio.wait_for(
+            provider.call(request),
+            timeout=timeout,
+        )
+
+    except asyncio.TimeoutError:
+        await provider.circuit.record_timeout()
+        return None
+
+    except Exception as exc:
+        await provider.circuit.record_exception(exc)
+        return None
+
+Không bao giờ:
+
+Python
+Chạy
+except Exception:
+    raise
+
+ở boundary provider.
+
+Exception phải được chuyển thành failure signal, sau đó router quyết định provider kế tiếp.
+
+Rule 2 — CLIProxy phải là process boundary thật
+
+Đừng embed Go CLIProxy vào Python.
+
+Giữ:
+
+Python Gateway
+       │
+       │ TCP localhost
+       ▼
+cli-proxy-api.exe
+
+Nếu Go chết:
+
+socket error
+     ↓
+Circuit OPEN
+     ↓
+Tier-4 unavailable
+     ↓
+Gateway continues
+
+Watchdog:
+
+process dead
+     ↓
+restart
+     ↓
+new process
+     ↓
+health revalidation
+Rule 3 — Socket luôn có deadline
+
+Mọi socket/HTTP/CDP operation phải có timeout.
+
+Ví dụ:
+
+Python
+Chạy
+async def bounded_call(coro, timeout):
+    try:
+        return await asyncio.wait_for(
+            coro,
+            timeout=timeout,
+        )
+    except asyncio.TimeoutError:
+        return None
+
+Không có:
+
+Python
+Chạy
+await socket_operation()
+
+mà không có deadline ở critical path.
+
+Rule 4 — Socket cleanup trong finally
+Python
+Chạy
+sock = None
+
+try:
+    sock = await open_socket()
+    return await use_socket(sock)
+
+finally:
+    if sock is not None:
+        try:
+            sock.close()
+        except Exception:
+            pass
+
+Nếu dùng asyncio streams:
+
+Python
+Chạy
+writer.close()
+
+try:
+    await writer.wait_closed()
+except Exception:
+    pass
+
+Như vậy timeout không để lại socket dangling.
+
+Rule 5 — Watchdog không được phụ thuộc Gateway request
+
+Watchdog là:
+
+Gateway
+  │
+  ├── Request supervisor
+  │
+  └── Watchdog
+
+không phải:
+
+Request
+  ↓
+watchdog
+  ↓
+restart
+
+Watchdog chết → Gateway vẫn chạy.
+
+Gateway request chết → Watchdog vẫn chạy.
+
+CLIProxy chết → Gateway vẫn chạy.
+
+Đây chính là failure-domain separation.
+
+3. Phase 11 — Chaos Testing
+
+Phase này mình sẽ làm khá “nghiêm”: không chỉ kiểm tra HTTP 200, mà kiểm tra invariant.
+
+Mỗi test request cần ghi:
+
+request_id
+started_monotonic
+finished_monotonic
+duration_ms
+final_provider
+hop_count
+failover_count
+result
+
+Invariant chính:
+
+SUCCESS
+AND
+duration < 25s
+
+Nếu failure:
+
+FAIL
+
+dù cuối cùng có thể nhận được 200 sau 26 giây.
+
+Chaos Test Matrix
+Test	Fault	Expected
+C1	1 Gemini → 429	next provider
+C2	3 Gemini → 429	remaining providers
+C3	5 Gemini → 429	Tier-4
+C4	OAuth invalid	circuit isolation
+C5	CLIProxy killed	watchdog restart
+C6	CLIProxy killed mid-request	failover
+C7	localhost socket timeout	bounded failure
+C8	Neon unavailable	Gemini unaffected
+C9	multiple simultaneous failures	no retry storm
+C10	repeated chaos	25s invariant
+Chaos runner
+
+Không cần framework.
+
+Python
+Chạy
+import asyncio
+import random
+import time
+
+
+REQUEST_DEADLINE = 25.0
+
+
+async def chaos_request(
+    session,
+    url="/v1/chat/completions",
+):
+
+    started = time.monotonic()
+
+    try:
+        async with asyncio.timeout(
+            REQUEST_DEADLINE
+        ):
+            response = await session.post(url)
+
+            elapsed = time.monotonic() - started
+
+            return {
+                "success": response.status == 200,
+                "elapsed_ms": int(elapsed * 1000),
+                "status": response.status,
+            }
+
+    except TimeoutError:
+
+        elapsed = time.monotonic() - started
+
+        return {
+            "success": False,
+            "elapsed_ms": int(elapsed * 1000),
+            "reason": "HARD_DEADLINE",
+        }
+
+Nếu Python version không hỗ trợ asyncio.timeout(), dùng asyncio.wait_for().
+
+Chaos 1 — Random Gemini failures
+
+Ở production không nên “kill account” thật.
+
+Mock failure tại provider boundary:
+
+Python
+Chạy
+class ChaosProvider:
+
+    def __init__(self, provider, failure_rate=0.0):
+        self.provider = provider
+        self.failure_rate = failure_rate
+
+    async def call(self, request):
+
+        if random.random() < self.failure_rate:
+            raise RetryableError("CHAOS_429")
+
+        return await self.provider.call(request)
+
+Ví dụ:
+
+Python
+Chạy
+providers = [
+    ChaosProvider(p, 0.8)
+    for p in gemini_providers
+]
+
+→ giả lập 80% request của từng provider bị 429.
+
+Muốn test 5/5 chết:
+
+Python
+Chạy
+providers = [
+    ChaosProvider(p, 1.0)
+    for p in gemini_providers
+]
+
+Expected:
+
+Gemini 1 → fail
+Gemini 2 → fail
+Gemini 3 → fail
+Gemini 4 → fail
+Gemini 5 → fail
+                ↓
+             Tier-4
+                ↓
+             SUCCESS
+Chaos 2 — Kill CLIProxy
+
+PowerShell:
+
+PowerShell
+Stop-Process -Name "cli-proxy-api" -Force
+
+Hoặc Python:
+
+Python
+Chạy
+import subprocess
+
+subprocess.run(
+    [
+        "taskkill",
+        "/F",
+        "/IM",
+        "cli-proxy-api.exe",
+    ],
+    check=False,
+)
+
+Sau đó chạy liên tục:
+
+request
+request
+KILL
+request
+request
+request
+
+Expected:
+
+CLIProxy killed
+      ↓
+socket failure
+      ↓
+Tier-4 circuit OPEN
+      ↓
+Gemini/Tier-3 handles request
+      ↓
+Watchdog resurrects CLIProxy
+      ↓
+deep health
+      ↓
+Tier-4 returns
+
+Không được để client connection drop chỉ vì Tier-4 chết.
+
+Chaos 3 — Socket timeout
+
+Đây là test cực quan trọng vì timeout là thứ dễ tạo hang nhất.
+
+Tạo provider giả:
+
+Python
+Chạy
+async def hanging_provider(request):
+    await asyncio.sleep(60)
+
+Sau đó:
+
+Python
+Chạy
+try:
+    await asyncio.wait_for(
+        hanging_provider(request),
+        timeout=5.0,
+    )
+except asyncio.TimeoutError:
+    # expected
+    pass
+
+Expected:
+
+provider hangs 60s
+        ↓
+provider timeout 5s
+        ↓
+circuit failure
+        ↓
+next provider
+        ↓
+request < 25s
+
+Nếu test mất 60 giây thì Phase 7 chưa thực sự có hard deadline ở tầng upstream.
+
+Chaos 4 — Retry storm detector
+
+Mình còn khuyên thêm một metric rất nhỏ:
+
+Python
+Chạy
+retry_counter
+
+Mỗi request:
+
+request_id
+hop_count
+retry_count
+
+Sau chaos test:
+
+max_hops <= 5
+max_retry <= 4
+
+và đặc biệt:
+
+total_upstream_attempts
+    <=
+client_requests × MAX_HOPS
+
+Nếu 100 client request tạo ra 10.000 upstream attempts thì có retry storm.
+
+Golden Invariants cho toàn LAR-OS
+
+Đây là bộ invariant mình sẽ dùng làm acceptance criteria Phase 8/9/11:
+
+I1  Gateway process survives any provider exception.
+
+I2  Gateway process survives CLIProxy crash.
+
+I3  No provider failure propagates into another provider's state.
+
+I4  No socket remains indefinitely after timeout.
+
+I5  Every upstream attempt has a finite timeout.
+
+I6  Every client request has one monotonic hard deadline.
+
+I7  MAX_HOPS <= 5.
+
+I8  Retry sleep never exceeds remaining deadline.
+
+I9  Retryable errors only are retried.
+
+I10 SQLite failure cannot break request routing.
+
+I11 Telemetry failure cannot break request routing.
+
+I12 Watchdog failure cannot break request routing.
+
+I13 Background maintenance has no busy loop.
+
+I14 Idle CPU remains approximately 0%.
+
+I15 RAM remains <45 MB.
+
+I16 Five Gemini failures trigger Tier-4 fallback.
+
+I17 CLIProxy recovery does not require Gateway restart.
+
+I18 Chaos request either succeeds within 25s
+    or explicitly fails by the 25s deadline.
+Và có một invariant rất đáng test thêm
+
+No cascading circuit mutation.
+
+Ví dụ Gemini-1 timeout:
+
+Gemini-1 → OPEN
+
+không được làm:
+
+Gemini-2 → OPEN
+Gemini-3 → OPEN
+Gemini-4 → OPEN
+
+trừ khi chính chúng cũng thất bại.
+
+Mỗi circuit phải có state ownership riêng.
+
+Kiến trúc cuối sau Phase 8/9/11
+                         ┌──────────────────┐
+                         │   LAR-OS Gateway │
+                         └────────┬─────────┘
+                                  │
+                         25s Deadline
+                                  │
+                    ┌─────────────▼─────────────┐
+                    │ Dynamic Router + Retry    │
+                    │ max 5 hops + jitter       │
+                    └─────────────┬─────────────┘
+                                  │
+             ┌────────────────────┼──────────────────┐
+             │                    │                  │
+             ▼                    ▼                  ▼
+        Tier-1 Cache       Gemini Pool          Tier-3 Neon
+             │             1 2 3 4 5                │
+             │                    │                  │
+             │              independent             │
+             │               circuits               │
+             │                    │                  │
+             │                    ▼                  │
+             │              Tier-4 CLIProxy          │
+             │                    │                  │
+             │              process boundary         │
+             │                    │                  │
+             │              Deep Health               │
+             │                    │                  │
+             └────────────────────┼──────────────────┘
+                                  │
+                              Telemetry
+                                  │
+                             SQLite WAL
+                                  │
+                         /status + /dashboard
+
+Phase 8 sẽ chứng minh CLIProxy sống thật hay chỉ “còn process”.
+Phase 9 sẽ biến từng tầng thành một failure domain độc lập.
+Phase 11 sẽ chứng minh bằng fault injection rằng những boundary đó thực sự hoạt động, thay vì chỉ đẹp trên architecture diagram.
+
+Với footprint hiện tại 35 MB RAM, mình sẽ không thêm bất kỳ daemon/monitoring framework nào cho ba phase này. Phase 8 chỉ event-triggered probe, Phase 9 chủ yếu là boundary/timeout/cleanup, Phase 11 là test runner chạy khi cần rồi thoát. Production idle path vì thế vẫn có thể giữ quanh 0% CPU, còn memory tăng thêm chỉ ở mức rất nhỏ.
