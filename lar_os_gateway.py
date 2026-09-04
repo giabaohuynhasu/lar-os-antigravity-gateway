@@ -373,6 +373,36 @@ class TelemetryStore:
             "max_db_bytes": MAX_DB_BYTES
         }
 
+    def get_recent_events(self, limit: int = 20) -> list:
+        results = []
+        KIND_NAMES = {1: "REQUEST", 2: "SUCCESS", 3: "FAILURE", 4: "STATE", 5: "FAILOVER", 6: "WATCHDOG", 7: "PRUNE"}
+        PROVIDER_REV = {v: k for k, v in PROVIDER_CODE_MAP.items()}
+        try:
+            conn = sqlite3.connect(self.db_path, timeout=0.1)
+            try:
+                rows = conn.execute(
+                    "SELECT ts, kind, provider, latency_ms, state, value FROM telemetry_events ORDER BY id DESC LIMIT ?",
+                    (limit,)
+                ).fetchall()
+                for r in rows:
+                    t_str = time.strftime("%H:%M:%S", time.localtime(r[0] / 1000.0))
+                    k_name = KIND_NAMES.get(r[1], str(r[1]))
+                    p_name = PROVIDER_REV.get(r[2], f"P{r[2]}")
+                    if "@" in p_name:
+                        p_name = p_name.split("@")[0]
+                    results.append({
+                        "time": t_str,
+                        "kind": k_name,
+                        "provider": p_name,
+                        "latency_ms": f"{r[3]}ms" if r[3] is not None else ("" if r[5] is None else f"val={r[5]}"),
+                        "state": r[4]
+                    })
+            finally:
+                conn.close()
+        except Exception:
+            pass
+        return results
+
 telemetry_store = TelemetryStore(TELEMETRY_DB_PATH)
 
 # ==========================================
@@ -397,6 +427,13 @@ COOLDOWN_429 = 60.0
 COOLDOWN_TIMEOUT = 30.0
 COOLDOWN_5XX = 15.0
 JITTER_MAX = 15.0
+
+REQUEST_BUDGET_SEC = 25.0
+MAX_FAILOVER_HOPS = 4
+
+def decorrelated_jitter(previous_delay: float, base: float = 0.25, cap: float = 2.0) -> float:
+    upper = max(base, previous_delay * 3.0)
+    return min(cap, random.uniform(base, upper))
 
 EMA_ALPHA = 0.2
 FAILURE_PENALTY = 10.0
@@ -948,15 +985,28 @@ async def execute_model_request(model: str, messages: List[Dict[str, Any]], tool
                 return {"text": resp_text, "tool_calls": tool_calls}
         return None
 
+    # Monotonic deadline budget & Decorrelated Jitter state (Phase 7)
+    deadline = time.monotonic() + REQUEST_BUDGET_SEC
+    previous_delay = 0.25
+    hop_count = 0
+
     if ordered_pool:
         for key_entry in ordered_pool:
+            if hop_count >= MAX_FAILOVER_HOPS:
+                break
+            remaining = deadline - time.monotonic()
+            if remaining <= 2.0:
+                break
+
             acc = key_entry["account"]
             cb = get_circuit(acc)
+            hop_count += 1
             t_start = time.monotonic()
+            call_timeout = min(8.0, remaining)
             try:
                 res_dict = await asyncio.wait_for(
                     asyncio.to_thread(_do_request_sync, key_entry["key"], target_model, compacted_query, gemini_tools),
-                    timeout=12.5
+                    timeout=call_timeout
                 )
                 elapsed_ms = (time.monotonic() - t_start) * 1000.0
                 if res_dict:
@@ -973,15 +1023,30 @@ async def execute_model_request(model: str, messages: List[Dict[str, Any]], tool
                     return res_dict
             except Exception as e:
                 err_msg = str(e).lower()
-                if "429" in err_msg or "resource_exhausted" in err_msg:
+                is_429 = "429" in err_msg or "resource_exhausted" in err_msg
+                is_5xx = "500" in err_msg or "503" in err_msg or "502" in err_msg
+                is_timeout = isinstance(e, asyncio.TimeoutError) or "timeout" in err_msg
+
+                if is_429:
                     kind = FailureKind.HTTP_429
                     err_val = 429
-                elif "500" in err_msg or "503" in err_msg or "502" in err_msg:
+                elif is_5xx:
                     kind = FailureKind.HTTP_5XX
                     err_val = 500
-                else:
+                elif is_timeout:
                     kind = FailureKind.TIMEOUT
                     err_val = 408
+                else:
+                    log_event(f"❌ Non-retryable error on {acc}: {e}")
+                    await cb.record_failure(FailureKind.TIMEOUT)
+                    telemetry_store.emit(
+                        kind=TelemetryKind.FAILURE,
+                        provider=get_provider_code(acc),
+                        state=StateCode.OPEN,
+                        value=400
+                    )
+                    break
+
                 await cb.record_failure(kind)
                 telemetry_store.emit(
                     kind=TelemetryKind.FAILURE,
@@ -989,20 +1054,28 @@ async def execute_model_request(model: str, messages: List[Dict[str, Any]], tool
                     state=StateCode.OPEN,
                     value=err_val
                 )
+
+                # Decorrelated Jitter sleep before next hop (Phase 7)
+                rem_after = deadline - time.monotonic()
+                if rem_after > 2.0 and hop_count < len(ordered_pool):
+                    delay = decorrelated_jitter(previous_delay)
+                    previous_delay = delay
+                    await asyncio.sleep(min(delay, rem_after - 1.5))
                 continue
     else:
         log_event("🔄 All primary Gemini circuits in OPEN state (Score <= 0). Fast-falling back to Tier-4...")
 
     # Tier 4: Antigravity OAuth Failover (100% Free Uncapped Backup via CLIProxyAPI)
     t4_cb = get_circuit("tier4_cliproxyapi")
-    if await t4_cb.allow_request():
-        log_event("🛡️ Activating TIER 4 FAILOVER (CLIProxyAPI Antigravity)...")
+    remaining_t4 = deadline - time.monotonic()
+    if remaining_t4 > 1.5 and await t4_cb.allow_request():
+        log_event(f"🛡️ Activating TIER 4 FAILOVER (CLIProxyAPI Antigravity, budget remaining: {remaining_t4:.1f}s)...")
         telemetry_store.emit(kind=TelemetryKind.FAILOVER, provider=0, value=6)
         t4_start = time.monotonic()
         try:
             failover_res = await asyncio.wait_for(
                 asyncio.to_thread(_call_cliproxy_sync, target_model, compacted_query, tools),
-                timeout=30.0
+                timeout=min(20.0, remaining_t4)
             )
             t4_elapsed_ms = (time.monotonic() - t4_start) * 1000.0
             if failover_res and failover_res.get("text"):
@@ -1031,8 +1104,230 @@ async def execute_model_request(model: str, messages: List[Dict[str, Any]], tool
     return {"text": "[LAR-OS Gateway Failover] All active accounts and failover circuits are currently cooling down. Retry shortly.", "tool_calls": []}
 
 # ==========================================
-# 8. API ENDPOINTS
+# 8. ZERO-FRAMEWORK HTML DASHBOARD (Phase 10)
 # ==========================================
+DASHBOARD_HTML = r"""<!doctype html>
+<html lang="vi">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>LAR-OS Unified AI Gateway v3.4 Dashboard</title>
+<style>
+:root{
+  color-scheme:dark;
+  --bg:#090d13;
+  --panel:#121822;
+  --border:#212c3d;
+  --text:#e6edf3;
+  --muted:#8b949e;
+  --good:#3fb950;
+  --warn:#d29922;
+  --bad:#f85149;
+  --accent:#58a6ff;
+}
+*{box-sizing:border-box}
+body{
+  margin:0;
+  background:var(--bg);
+  color:var(--text);
+  font:13px -apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Helvetica,sans-serif;
+}
+main{
+  max-width:1050px;
+  margin:28px auto;
+  padding:0 16px;
+}
+header{
+  display:flex;
+  justify-content:space-between;
+  align-items:center;
+  margin-bottom:20px;
+  border-bottom:1px solid var(--border);
+  padding-bottom:16px;
+}
+h1{font-size:20px;margin:0;color:#fff;display:flex;align-items:center;gap:8px}
+.badge{background:#1f6feb26;color:var(--accent);border:1px solid #388bfd40;padding:2px 8px;border-radius:12px;font-size:11px}
+.sub{color:var(--muted);font-size:12px;margin-top:4px}
+.status-pill{display:flex;align-items:center;gap:6px;font-weight:600;font-size:12px}
+.dot{width:8px;height:8px;border-radius:50%;background:var(--good);box-shadow:0 0 8px var(--good)}
+.grid{display:grid;grid-template-columns:repeat(4,1fr);gap:12px;margin-bottom:18px}
+.card{background:var(--panel);border:1px solid var(--border);border-radius:8px;padding:14px}
+.metric{font-size:22px;font-weight:700;color:#fff}
+.label{color:var(--muted);font-size:11px;margin-top:4px;text-transform:uppercase;letter-spacing:0.5px}
+h3{margin:0 0 12px 0;font-size:14px;color:#fff;display:flex;justify-content:space-between;align-items:center}
+.providers{display:grid;gap:8px}
+.provider{display:grid;grid-template-columns:180px 1fr 60px 80px 80px;gap:12px;align-items:center;padding:6px 0;border-bottom:1px solid #1a222e}
+.bar{height:6px;background:#1b2330;border-radius:99px;overflow:hidden}
+.fill{height:100%;background:var(--accent);transition:width 0.3s}
+.fill.warn{background:var(--warn)}
+.fill.bad{background:var(--bad)}
+.state-tag{font-size:11px;padding:2px 6px;border-radius:4px;text-align:center;font-weight:600}
+.state-closed{background:#23863626;color:var(--good);border:1px solid #2ea04340}
+.state-open{background:#da363326;color:var(--bad);border:1px solid #f8514940}
+.state-half_open{background:#9e6a0326;color:var(--warn);border:1px solid #d2992240}
+.events-table{width:100%;border-collapse:collapse;font-family:ui-monospace,SFMono-Regular,Consolas,monospace;font-size:11px}
+.events-table th{text-align:left;color:var(--muted);padding:6px 8px;border-bottom:1px solid var(--border)}
+.events-table td{padding:6px 8px;border-bottom:1px solid #161d28}
+.tag-req{color:#a5d6ff}
+.tag-succ{color:var(--good)}
+.tag-fail{color:var(--bad)}
+.tag-state{color:var(--warn)}
+.tag-failover{color:#d2a8ff}
+.tag-watchdog{color:#ffa657}
+@media(max-width:768px){
+  .grid{grid-template-columns:repeat(2,1fr)}
+  .provider{grid-template-columns:120px 1fr 50px}
+  .provider .extra{display:none}
+}
+</style>
+</head>
+<body>
+<main>
+<header>
+  <div>
+    <h1>LAR-OS Unified Gateway <span class="badge">v3.4 Production</span></h1>
+    <div class="sub">Self-Healing AI Routing &bull; Latency EMA &bull; SQLite WAL Telemetry &bull; Zero-Framework Dashboard</div>
+  </div>
+  <div class="status-pill"><span class="dot"></span><span id="sysStatus">ONLINE</span></div>
+</header>
+
+<section class="grid">
+  <div class="card">
+    <div id="avgScore" class="metric">—</div>
+    <div class="label">Average Health Score</div>
+  </div>
+  <div class="card">
+    <div id="avgLatency" class="metric">—</div>
+    <div class="label">System Latency EMA</div>
+  </div>
+  <div class="card">
+    <div id="totalReqs" class="metric">—</div>
+    <div class="label">Total Requests Handled</div>
+  </div>
+  <div class="card">
+    <div id="dbSize" class="metric">—</div>
+    <div class="label">SQLite Telemetry Size</div>
+  </div>
+</section>
+
+<div class="card" style="margin-bottom:16px;">
+  <h3>Circuits &amp; Health Scoring <span id="activeCount" style="font-size:12px;color:var(--muted);font-weight:normal;"></span></h3>
+  <div id="providers" class="providers"></div>
+</div>
+
+<div class="card">
+  <h3>Recent Telemetry Events (Live WAL Stream)</h3>
+  <table class="events-table">
+    <thead>
+      <tr><th>Time</th><th>Kind</th><th>Provider</th><th>Latency / Param</th><th>State</th></tr>
+    </thead>
+    <tbody id="eventsBody"></tbody>
+  </table>
+</div>
+</main>
+
+<script>
+const $ = id => document.getElementById(id);
+function esc(v){ return String(v ?? '').replaceAll('&','&amp;').replaceAll('<','&lt;').replaceAll('>','&gt;'); }
+
+function render(data){
+  const providers = data.providers || data.circuits || [];
+  const active = providers.filter(p => Number(p.health_score) > 0);
+  const scores = active.map(p => Number(p.health_score));
+  const latencies = active.map(p => Number(p.latency_ema_ms || p.latency_ema)).filter(Number.isFinite);
+
+  const avgScore = scores.length ? (scores.reduce((a,b)=>a+b,0)/scores.length) : 0;
+  const avgLat = latencies.length ? (latencies.reduce((a,b)=>a+b,0)/latencies.length) : 0;
+
+  $('avgScore').textContent = avgScore.toFixed(1);
+  $('avgLatency').textContent = avgLat ? Math.round(avgLat) + 'ms' : '—';
+  $('totalReqs').textContent = data.total_requests ?? 0;
+  $('dbSize').textContent = (data.telemetry?.db_size_kb ? data.telemetry.db_size_kb + ' KB' : '—');
+  $('activeCount').textContent = active.length + ' / ' + providers.length + ' providers ready';
+
+  $('providers').innerHTML = providers.map(p => {
+    const s = Number(p.health_score ?? 0);
+    const w = Math.max(0, Math.min(100, s));
+    const st = String(p.state || 'closed').toLowerCase();
+    const fillClass = s < 0 ? 'bad' : (s < 50 ? 'warn' : '');
+    const lat = p.latency_ema_ms || p.latency_ema;
+    const latStr = Number.isFinite(Number(lat)) ? Math.round(lat) + 'ms' : '—';
+    const cd = p.cooldown_remaining_sec > 0 ? p.cooldown_remaining_sec + 's' : '';
+    let nameStr = esc(p.name);
+    if(nameStr.includes('@')) nameStr = nameStr.split('@')[0];
+
+    return `
+      <div class="provider">
+        <strong style="white-space:nowrap;overflow:hidden;text-overflow:ellipsis;">${nameStr}</strong>
+        <div class="bar"><div class="fill ${fillClass}" style="width:${w}%"></div></div>
+        <strong style="color:${s < 0 ? 'var(--bad)' : 'inherit'}">${s >= 0 ? s.toFixed(1) : 'OPEN'}</strong>
+        <span class="extra" style="color:var(--muted);">${latStr}</span>
+        <span class="state-tag state-${st}">${st.toUpperCase()} ${cd}</span>
+      </div>
+    `;
+  }).join('');
+
+  const evList = data.events || [];
+  $('eventsBody').innerHTML = evList.map(e => {
+    let kClass = 'tag-req';
+    if(e.kind === 'SUCCESS') kClass = 'tag-succ';
+    else if(e.kind === 'FAILURE') kClass = 'tag-fail';
+    else if(e.kind === 'STATE') kClass = 'tag-state';
+    else if(e.kind === 'FAILOVER') kClass = 'tag-failover';
+    else if(e.kind === 'WATCHDOG') kClass = 'tag-watchdog';
+
+    return `
+      <tr>
+        <td style="color:var(--muted);">${esc(e.time)}</td>
+        <td class="${kClass}"><b>${esc(e.kind)}</b></td>
+        <td>${esc(e.provider)}</td>
+        <td style="color:${e.latency_ms?.includes('ms') ? 'var(--good)' : 'inherit'}">${esc(e.latency_ms)}</td>
+        <td>${e.state !== null && e.state !== undefined ? (e.state === 0 ? 'CLOSED' : (e.state === 1 ? 'OPEN' : 'HALF_OPEN')) : '—'}</td>
+      </tr>
+    `;
+  }).join('');
+}
+
+let timer = null;
+async function refresh(){
+  if(document.hidden) return;
+  try{
+    const r = await fetch('/status', { cache: 'no-store' });
+    if(r.ok) render(await r.json());
+  }catch(err){
+    $('sysStatus').textContent = 'RECONNECTING';
+    $('sysStatus').style.color = 'var(--warn)';
+  }
+}
+
+function startPolling(){
+  refresh();
+  if(!timer) timer = setInterval(refresh, 3500);
+}
+
+function stopPolling(){
+  if(timer){ clearInterval(timer); timer = null; }
+}
+
+document.addEventListener('visibilitychange', () => {
+  if(document.hidden) stopPolling();
+  else startPolling();
+});
+
+startPolling();
+</script>
+</body>
+</html>
+"""
+
+# ==========================================
+# 9. API ENDPOINTS
+# ==========================================
+@app.get("/dashboard", response_class=HTMLResponse)
+@app.get("/status/ui", response_class=HTMLResponse)
+async def gateway_dashboard():
+    return HTMLResponse(content=DASHBOARD_HTML, status_code=200)
+
 @app.get("/")
 @app.get("/health")
 async def health_check():
@@ -1042,7 +1337,7 @@ async def health_check():
     telemetry_stat = telemetry_store.snapshot()
     return {
         "status": "ONLINE",
-        "service": "LAR-OS Unified AI Gateway v3.3 (Adaptive Scoring & WAL Telemetry)",
+        "service": "LAR-OS Unified AI Gateway v3.4 (Bounded Retry & Zero-Framework Dashboard)",
         "architecture": "Supervised 4-Tier Heterogeneous Redundancy + 3-State Circuit Breakers + SQLite WAL Telemetry",
         "uptime_seconds": int(time.time() - STATS["start_time"]),
         "total_requests": STATS["total_requests"],
@@ -1063,16 +1358,19 @@ async def gateway_status():
     circuits_snapshot = [await cb.snapshot() for cb in CIRCUITS.values()]
     watchdog_stat = cli_watchdog.status()
     telemetry_stat = telemetry_store.snapshot()
+    recent_events = telemetry_store.get_recent_events(limit=20)
     return {
         "status": "ONLINE",
-        "service": "LAR-OS Unified AI Gateway v3.3",
+        "service": "LAR-OS Unified AI Gateway v3.4",
         "uptime_seconds": int(time.time() - STATS["start_time"]),
         "total_requests": STATS["total_requests"],
         "cache_hits": STATS["cache_hits"],
         "tokens_saved_chars": STATS["tokens_saved_chars"],
         "telemetry": telemetry_stat,
+        "providers": circuits_snapshot,
         "circuits": circuits_snapshot,
-        "watchdog": watchdog_stat
+        "watchdog": watchdog_stat,
+        "events": recent_events
     }
 
 @app.get("/v1/drive/status")
