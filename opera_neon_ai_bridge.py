@@ -239,7 +239,11 @@ class OperaNeonBridge:
             var input = findChatInput();
             if (!input) return {{ ok: false, error: "Canonical chat composer not found" }};
             
+            // Smoothly scroll to bottom and scroll composer into view so user can follow
+            window.scrollTo({{ top: document.body.scrollHeight, behavior: 'smooth' }});
+            input.scrollIntoView({{ behavior: 'smooth', block: 'end' }});
             input.focus();
+
             if (input.getAttribute('contenteditable') === 'true' || input.classList.contains('ProseMirror')) {{
                 // ProseMirror in React 18: innerHTML paragraph + input/change dispatch
                 input.innerHTML = '<p>' + {escaped_prompt}.replace(/\\n/g, '<br>') + '</p>';
@@ -257,10 +261,11 @@ class OperaNeonBridge:
             }}
             
             // Poll for send button inside composer container to become enabled
-            for (var i = 0; i < 15; i++) {{
-                await new Promise(r => setTimeout(r, 100));
+            for (var i = 0; i < 20; i++) {{
+                await new Promise(r => setTimeout(r, 120));
                 var container = input.closest('fieldset, form, #composer-background, footer, [data-testid="composer"]') || document;
-                var sendBtn = container.querySelector('#composer-submit-button') || 
+                var sendBtn = container.querySelector('button.composer-submit-button-color') ||
+                              container.querySelector('#composer-submit-button') || 
                               container.querySelector('button[data-testid="send-button"]') || 
                               container.querySelector('button[aria-label*="Gửi"]') ||
                               container.querySelector('button[aria-label*="Send"]') ||

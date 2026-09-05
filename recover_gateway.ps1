@@ -13,8 +13,13 @@ Write-Host "[1/3] Scanning for hanging Gateway processes..." -ForegroundColor Ye
 $PortProcesses = Get-NetTCPConnection -LocalPort 18797 -ErrorAction SilentlyContinue | Select-Object -ExpandProperty OwningProcess -Unique
 if ($PortProcesses) {
     foreach ($pidToKill in $PortProcesses) {
-        Write-Host "      Killing hung process PID $pidToKill on port 18797..." -ForegroundColor Red
-        Stop-Process -Id $pidToKill -Force -ErrorAction SilentlyContinue
+        $proc = Get-Process -Id $pidToKill -ErrorAction SilentlyContinue
+        if ($proc -and ($proc.ProcessName -like "*python*" -or $proc.ProcessName -like "*uvicorn*")) {
+            Write-Host "      Killing hung Gateway process PID $pidToKill ($($proc.ProcessName)) on port 18797..." -ForegroundColor Red
+            Stop-Process -Id $pidToKill -Force -ErrorAction SilentlyContinue
+        } else {
+            Write-Host "      WARNING: Non-Gateway process PID $pidToKill ($($proc.ProcessName)) is occupying port 18797! Skipping force-kill for safety." -ForegroundColor Magenta
+        }
     }
 } else {
     Write-Host "      No active listener found on port 18797." -ForegroundColor Green

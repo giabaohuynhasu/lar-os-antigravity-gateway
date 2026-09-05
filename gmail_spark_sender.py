@@ -261,7 +261,27 @@ class GmailSparkSender:
         return await self.send_report_email(subject=subject, body_html=body_html)
 
 if __name__ == "__main__":
-    sender = GmailSparkSender()
-    tab = sender.get_or_open_gmail_tab()
-    print("[+] Gmail Tab Found:", tab.get("title") if tab else "None")
+    import argparse
+    parser = argparse.ArgumentParser(description="LAR-OS Gmail Spark Dispatcher")
+    parser.add_argument("--send-sos", action="store_true", help="Send Nuclear SOS alert from JSON payload file")
+    parser.add_argument("--payload-file", type=str, help="Path to JSON file with incident and forensic data")
+    args = parser.parse_args()
+
+    if args.send_sos and args.payload_file:
+        try:
+            with open(args.payload_file, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            incident = data.get("incident", {})
+            forensic = data.get("forensic", [])
+            sender = GmailSparkSender()
+            result = asyncio.run(sender.send_nuclear_sos_alert(incident, forensic))
+            print(json.dumps({"ok": True, "result": result}))
+            sys.exit(0 if result.get("ok") else 1)
+        except Exception as e:
+            print(json.dumps({"ok": False, "error": str(e)}))
+            sys.exit(1)
+    else:
+        sender = GmailSparkSender()
+        tab = sender.get_or_open_gmail_tab()
+        print("[+] Gmail Tab Found:", tab.get("title") if tab else "None")
 

@@ -68,6 +68,46 @@ def is_pid_alive(pid: int) -> bool:
         except OSError:
             return False
 
+def get_windows_process_creation_time(pid: int) -> float:
+    """Gets process creation time using Windows GetProcessTimes API or 0.0 if not available."""
+    if pid <= 0:
+        return 0.0
+    if sys.platform.startswith("win"):
+        try:
+            import ctypes
+            from ctypes import wintypes
+            PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
+            handle = ctypes.windll.kernel32.OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, False, pid)
+            if handle:
+                try:
+                    class FILETIME(ctypes.Structure):
+                        _fields_ = [("dwLowDateTime", wintypes.DWORD), ("dwHighDateTime", wintypes.DWORD)]
+                    ct, et, kt, ut = FILETIME(), FILETIME(), FILETIME(), FILETIME()
+                    if ctypes.windll.kernel32.GetProcessTimes(
+                        handle, ctypes.byref(ct), ctypes.byref(et), ctypes.byref(kt), ctypes.byref(ut)
+                    ):
+                        ft_val = (ct.dwHighDateTime << 32) + ct.dwLowDateTime
+                        return (ft_val - 116444736000000000) / 10000000.0
+                finally:
+                    ctypes.windll.kernel32.CloseHandle(handle)
+        except Exception:
+            pass
+    return 0.0
+
+def verify_process_incarnation(pid: int, expected_creation_time: float = 0.0) -> bool:
+    """
+    Phase 12.1: Verifies that PID is alive AND matches the expected process creation time.
+    Prevents PID reuse edge case where Windows recycles a dead Gateway PID to another process.
+    """
+    if not is_pid_alive(pid):
+        return False
+    if expected_creation_time > 0 and sys.platform.startswith("win"):
+        actual_time = get_windows_process_creation_time(pid)
+        if actual_time > 0 and abs(actual_time - expected_creation_time) > 2.0:
+            # PID is alive but belongs to a completely different process!
+            return False
+    return True
+
 def read_atomic_heartbeat() -> Optional[Dict[str, Any]]:
     """Reads Gateway heartbeat atomically."""
     if not HEARTBEAT_FILE.exists():
@@ -102,6 +142,7 @@ class NuclearWatcher:
         self.active_incident_id: Optional[str] = None
         self.restart_count = 0
         self.last_sos_time: float = 0.0
+        self.last_valid_heartbeat_time: float = time.time()
         self._load_state()
 
     def _load_state(self):
@@ -129,37 +170,52 @@ class NuclearWatcher:
 
     async def evaluate_liveness(self) -> tuple[str, Optional[Dict[str, Any]]]:
         """
-        Evaluates system liveness:
+        Phase 12.1 Enhanced Liveness Evaluation:
         Returns (Trigger, HeartbeatData)
-        Trigger can be: 'HEALTHY', 'GRACEFUL_EXIT', 'PROCESS_DEAD', 'EVENT_LOOP_HANG', 'MISSING_HEARTBEAT'
+        Trigger can be: 'HEALTHY', 'DEGRADED', 'GRACEFUL_EXIT', 'PROCESS_DEAD', 'EVENT_LOOP_HANG', 'MISSING_HEARTBEAT', 'STALE_GRACEFUL_EXHAUSTED'
         """
         hb = read_atomic_heartbeat()
         if hb is None:
+            # Check hysteresis: if recently healthy (< 30s), mark DEGRADED instead of instant NUCLEAR
+            if time.time() - self.last_valid_heartbeat_time < HEARTBEAT_MAX_AGE_SEC:
+                return "DEGRADED", None
             return "MISSING_HEARTBEAT", None
 
-        # Check if Gateway shut down intentionally
-        if hb.get("graceful") is True or hb.get("state") == "SHUTDOWN":
-            return "GRACEFUL_EXIT", hb
+        self.last_valid_heartbeat_time = time.time()
 
         pid = hb.get("pid", 0)
         ts = hb.get("ts", 0)
+        creation_time = hb.get("process_creation_time", 0.0)
         age = time.time() - ts
 
-        # Check Process L1
-        alive = is_pid_alive(pid)
-        if not alive:
+        # Check Process Incarnation (L1 + Creation Time verification against PID reuse)
+        is_incarnation_alive = verify_process_incarnation(pid, creation_time)
+
+        # Check if Gateway shut down intentionally
+        is_graceful = (hb.get("graceful") is True or hb.get("state") == "SHUTDOWN")
+        if is_graceful:
+            # P0: Stale Graceful Flag Prevention
+            # If the process is alive, or if shutdown happened recently (< 30s), respect it.
+            # But if process is dead AND age > HEARTBEAT_MAX_AGE_SEC, this is an abandoned/dead gateway!
+            if is_incarnation_alive or age <= HEARTBEAT_MAX_AGE_SEC:
+                return "GRACEFUL_EXIT", hb
+            else:
+                return "STALE_GRACEFUL_EXHAUSTED", hb
+
+        if not is_incarnation_alive:
             return "PROCESS_DEAD", hb
 
-        # Check Heartbeat L2
+        # Check Heartbeat L2 (Event Loop Hang)
         if age > HEARTBEAT_MAX_AGE_SEC:
             return "EVENT_LOOP_HANG", hb
 
         return "HEALTHY", hb
 
     async def dispatch_sos_alert(self, trigger: str, hb: Optional[Dict[str, Any]]):
-        """Sends pre-formatted Nuclear SOS email to user via GmailSparkSender."""
-        from gmail_spark_sender import GmailSparkSender
-
+        """
+        Phase 12.1: Dispatches Nuclear SOS alert via isolated child subprocess with 15.0s hard timeout.
+        Guarantees Watcher event loop NEVER stalls even if Opera Neon CDP or WebSocket hangs.
+        """
         inc_id = self.active_incident_id or f"NUC-{time.strftime('%Y%m%d-%H%M%S')}-{uuid.uuid4().hex[:4].upper()}"
         self.active_incident_id = inc_id
 
@@ -178,14 +234,39 @@ class NuclearWatcher:
 
         forensic = get_last_forensic_lines(8)
         print(f"🚨 [NUCLEAR EVENT TRIGGERED] {trigger} | ID: {inc_id}")
-        print(f"   Dispatching SOS alert to thuaquan228@gmail.com via Opera Neon CDP (9224)...")
+        print(f"   Dispatching isolated subprocess SOS alert to thuaquan228@gmail.com (15s deadline)...")
 
-        sender = GmailSparkSender()
+        tmp_payload_file = WORKSPACE_DIR / f".sos_payload_{uuid.uuid4().hex[:6]}.json"
         try:
-            res = await sender.send_nuclear_sos_alert(incident_info, forensic)
-            print(f"✓ SOS Dispatch Result: {res}")
+            with open(tmp_payload_file, "w", encoding="utf-8") as f:
+                json.dump({"incident": incident_info, "forensic": forensic}, f)
+
+            gmail_script = WORKSPACE_DIR / "gmail_spark_sender.py"
+            proc = await asyncio.create_subprocess_exec(
+                str(PYTHON_EXE), str(gmail_script),
+                "--send-sos", "--payload-file", str(tmp_payload_file),
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE
+            )
+            try:
+                stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=15.0)
+                out_str = stdout.decode("utf-8", errors="replace").strip()
+                print(f"✓ SOS Dispatch Result: {out_str}")
+            except asyncio.TimeoutError:
+                print("[-] SOS Dispatch timed out (>15.0s)! Terminating subprocess to protect Watcher loop...")
+                try:
+                    proc.kill()
+                    await proc.wait()
+                except Exception:
+                    pass
         except Exception as e:
-            print(f"[-] SOS Dispatch Exception: {e}")
+            print(f"[-] SOS Dispatch invocation error: {e}")
+        finally:
+            if tmp_payload_file.exists():
+                try:
+                    tmp_payload_file.unlink()
+                except Exception:
+                    pass
 
         self.last_sos_time = time.time()
         self._save_state()
@@ -224,11 +305,18 @@ class NuclearWatcher:
         trigger, hb = await self.evaluate_liveness()
 
         if trigger == "HEALTHY":
-            if self.state in (IncidentFSM.NUCLEAR, IncidentFSM.RECOVERING, IncidentFSM.EXHAUSTED):
+            if self.state in (IncidentFSM.DEGRADED, IncidentFSM.NUCLEAR, IncidentFSM.RECOVERING, IncidentFSM.EXHAUSTED):
                 print(f"✨ [GATEWAY RESTORED] Gateway resumed healthy heartbeat! Closing incident {self.active_incident_id}.")
                 self.state = IncidentFSM.GREEN
                 self.active_incident_id = None
                 self.restart_count = 0
+                self._save_state()
+            return self.state
+
+        if trigger == "DEGRADED":
+            if self.state == IncidentFSM.GREEN:
+                print("⚠️ [HEARTBEAT DEGRADED] Transient read failure, monitoring hysteresis...")
+                self.state = IncidentFSM.DEGRADED
                 self._save_state()
             return self.state
 

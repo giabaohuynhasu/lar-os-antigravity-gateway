@@ -886,16 +886,43 @@ cli_watchdog = CLIProxyWatchdog(executable=CLIPROXY_EXE, config=CLIPROXY_CONFIG)
 
 HEARTBEAT_PATH = CURRENT_DIR / "heartbeat.json"
 
+def get_windows_process_creation_time(pid: int) -> float:
+    """Gets process creation time using Windows GetProcessTimes API or time.time() fallback."""
+    if pid <= 0:
+        return 0.0
+    if sys.platform.startswith("win"):
+        try:
+            import ctypes
+            from ctypes import wintypes
+            PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
+            handle = ctypes.windll.kernel32.OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, False, pid)
+            if handle:
+                try:
+                    class FILETIME(ctypes.Structure):
+                        _fields_ = [("dwLowDateTime", wintypes.DWORD), ("dwHighDateTime", wintypes.DWORD)]
+                    ct, et, kt, ut = FILETIME(), FILETIME(), FILETIME(), FILETIME()
+                    if ctypes.windll.kernel32.GetProcessTimes(
+                        handle, ctypes.byref(ct), ctypes.byref(et), ctypes.byref(kt), ctypes.byref(ut)
+                    ):
+                        ft_val = (ct.dwHighDateTime << 32) + ct.dwLowDateTime
+                        return (ft_val - 116444736000000000) / 10000000.0
+                finally:
+                    ctypes.windll.kernel32.CloseHandle(handle)
+        except Exception:
+            pass
+    return time.time()
+
 class GatewayHeartbeatEmitter:
     """
-    Phase 12: Atomic Heartbeat Emitter for Nuclear Event Out-of-Band Watchdog.
-    Every 5 seconds, writes full forensic snapshot to .heartbeat.tmp then atomically
-    replaces heartbeat.json using os.replace().
+    Phase 12 / 12.1: Atomic Heartbeat Emitter for Nuclear Event Out-of-Band Watchdog.
+    Every 5 seconds, writes full forensic snapshot with boot_id and process_creation_time
+    to .heartbeat.tmp then atomically replaces heartbeat.json using os.replace().
     """
     def __init__(self, path: Path = HEARTBEAT_PATH, interval_sec: float = 5.0):
         self.path = path
         self.interval_sec = interval_sec
         self.boot_id = f"GW-{str(uuid.uuid4())[:8].upper()}"
+        self.process_creation_time = get_windows_process_creation_time(os.getpid())
         self._task: Optional[asyncio.Task] = None
         self._stop_event = asyncio.Event()
         self.last_provider_used: str = "INITIALIZING"
@@ -910,6 +937,7 @@ class GatewayHeartbeatEmitter:
             db_stat = telemetry_store.snapshot() if "telemetry_store" in globals() else {}
             payload = {
                 "pid": os.getpid(),
+                "process_creation_time": self.process_creation_time,
                 "ts": time.time(),
                 "boot_id": self.boot_id,
                 "state": "SHUTDOWN" if graceful else "SERVING",
