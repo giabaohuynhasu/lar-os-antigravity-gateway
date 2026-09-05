@@ -1,28 +1,3 @@
-# LAR-OS & ANTIGRAVITY SESSION CONTEXT SUMMARY
-**Updated**: 2026-09-05 17:07:08 (Local Time)
-**System Health**: 100% OPERATIONAL | ANTIGRAVITY IDE CURED & DISCHARGED (HOSPITAL.MD)
-**LAR-OS State**: Phase 12.1 Nuclear Hardening Complete (Chaos C1 - C14: 20/20 Passed)
-
----
-
-## 1. Executive Summary & Clinical Record
-- **Antigravity IDE v2.5.5 Clinical Discharge**:
-  - **Pathology**: Empty window (`MainWindowHandle = 0`), crash in Node ESM bootstrap (`ERR_MODULE_NOT_FOUND` on `out\main.js`).
-  - **Etiology**: 27 zombie `Antigravity IDE.exe` processes held `AntigravityIDEMutex` and locked binary files during auto-update, corrupting extraction.
-  - **Intervention**: Killed 27 zombie processes -> Ran in-place silent installer (`/VERYSILENT /SUPPRESSMSGBOXES /NORESTART`) -> Re-established `out\main.js` (15,040,636 bytes). User profile & extensions 100% intact.
-  - **Status**: Discharged. `MainWindowHandle = 11601146`, Language Server connected (PID `29412`), zero crashes.
-- **LAR-OS Gateway v3.6 & Nuclear Watcher v3.6**:
-  - PID reuse protection via native Windows `kernel32.GetProcessTimes` (`ctypes`).
-  - Isolated SOS subprocess execution (`gmail_spark_sender.py --send-sos`).
-  - Stale graceful flag handling & heartbeat read hysteresis.
-  - Stress Test Suite (Chaos C9 - C14): 6/6 PASSED (100 concurrent requests, p50=731ms, p95=1449ms).
-  - Total Chaos Test Suite: 20/20 PASSED (100.0%).
-
----
-
-## 2. ChatGPT Brainstorming: Preventive Measures ("Phòng Bệnh")
-*Consultation conducted via Opera Neon CDP (port 9224) without touching past messages.*
-
 Chúc mừng ca này 😄 Đây đúng là kiểu root-cause diagnosis đã đi tới tận filesystem/bootstrap layer, chứ không còn là “Electron tự nhiên không mở” nữa.
 
 Mình sẽ tách thành 3 phần: phòng tái phát → tích hợp LAR-OS → bản cập nhật Obsidian.
@@ -526,12 +501,3 @@ Vì vậy kiến trúc sạch nhất là:
 Nuclear Watcher bảo vệ quá trình chạy. Update Guard bảo vệ quá trình cập nhật. Binary Integrity Checker bảo vệ artifact.
 
 Ba lớp này nhỏ, độc lập và có thể làm zero-SaaS + zero-polling + zero-permanent-daemon. Đây là cách phòng tái phát mạnh hơn nhiều so với chỉ thêm một đoạn if main.js missing: reinstall.
-
----
-
-## 3. Golden Invariants
-- Gateway RAM: < 45MB (Current ~35MB)
-- Watcher RAM: < 15MB (Current ~8.4MB)
-- Idle CPU: 0.0%
-- SQLite: < 2MB (Current ~120KB)
-- Zero SaaS / Zero Docker dependencies.
