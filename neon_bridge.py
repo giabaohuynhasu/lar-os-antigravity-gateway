@@ -22,34 +22,17 @@ try:
 except ImportError:
     psycopg = None
 
-# Credentials provided by user
-DATABASE_URL = os.getenv(
-    "DATABASE_URL",
-    "postgresql://neondb_owner:REDACTED_PASSWORD@ep-odd-art-ayt56ir9.c-5.us-east-2.aws.neon.tech/neondb?sslmode=require"
-)
-
-DATABASE_URL_POOLED = os.getenv(
-    "DATABASE_URL_POOLED",
-    "postgresql://REDACTED_USER:REDACTED_PASSWORD@REDACTED_HOST/neondb?sslmode=require"
-)
-
-NEON_AUTH_BASE_URL = os.getenv(
-    "NEON_AUTH_BASE_URL",
-    "https://ep-odd-art-ayt56ir9.neonauth.c-5.us-east-2.aws.neon.tech/neondb/auth"
-)
-
-NEON_AI_GATEWAY_BASE_URL = os.getenv(
-    "NEON_AI_GATEWAY_BASE_URL",
-    "https://br-spring-dust-ayaan640-api.ai.c-5.us-east-2.aws.neon.tech"
-)
-
-NEON_AI_GATEWAY_TOKEN = os.getenv(
-    "NEON_AI_GATEWAY_TOKEN",
-    "REDACTED_TOKEN"
-)
+# Secure runtime configuration: strictly loaded from environment variables
+DATABASE_URL = os.getenv("DATABASE_URL") or os.getenv("NEON_DATABASE_URL")
+DATABASE_URL_POOLED = os.getenv("DATABASE_URL_POOLED") or os.getenv("NEON_DATABASE_URL_POOLED")
+NEON_AUTH_BASE_URL = os.getenv("NEON_AUTH_BASE_URL", "")
+NEON_AI_GATEWAY_BASE_URL = os.getenv("NEON_AI_GATEWAY_BASE_URL", "")
+NEON_AI_GATEWAY_TOKEN = os.getenv("NEON_AI_GATEWAY_TOKEN")
 
 def init_neon_database() -> Dict[str, Any]:
     """Initializes the required tables in Neon Serverless Postgres."""
+    if not DATABASE_URL:
+        return {"status": "error", "message": "Missing required environment variable: DATABASE_URL (or NEON_DATABASE_URL)"}
     if not psycopg:
         return {"status": "error", "message": "psycopg is not installed"}
 
@@ -90,6 +73,8 @@ def init_neon_database() -> Dict[str, Any]:
 
 def persist_handoff_to_neon(handoff_data: Dict[str, Any]) -> Dict[str, Any]:
     """Persists a cryptographic state handoff into Neon Postgres."""
+    if not DATABASE_URL:
+        return {"status": "error", "message": "Missing required environment variable: DATABASE_URL (or NEON_DATABASE_URL)"}
     if not psycopg:
         return {"status": "error", "message": "psycopg is not installed"}
 
@@ -117,7 +102,7 @@ def persist_handoff_to_neon(handoff_data: Dict[str, Any]) -> Dict[str, Any]:
 
 def fetch_latest_handoff_from_neon() -> Optional[Dict[str, Any]]:
     """Retrieves the latest verified state handoff from Neon Postgres."""
-    if not psycopg:
+    if not DATABASE_URL or not psycopg:
         return None
 
     try:
@@ -141,6 +126,8 @@ def fetch_latest_handoff_from_neon() -> Optional[Dict[str, Any]]:
 
 def persist_audit_to_neon(record_dict: Dict[str, Any]) -> Dict[str, Any]:
     """Persists a Third-Order Audit record into Neon Postgres."""
+    if not DATABASE_URL:
+        return {"status": "error", "message": "Missing required environment variable: DATABASE_URL (or NEON_DATABASE_URL)"}
     if not psycopg:
         return {"status": "error", "message": "psycopg is not installed"}
 
@@ -166,6 +153,9 @@ def persist_audit_to_neon(record_dict: Dict[str, Any]) -> Dict[str, Any]:
 
 def query_neon_ai_gateway(prompt: str, model: str = "claude-3-5-sonnet") -> Dict[str, Any]:
     """Queries Neon AI Gateway via standard OpenAI-compatible API."""
+    if not NEON_AI_GATEWAY_TOKEN or not NEON_AI_GATEWAY_BASE_URL:
+        return {"status": "error", "message": "Missing required environment variable: NEON_AI_GATEWAY_TOKEN or NEON_AI_GATEWAY_BASE_URL"}
+
     url = f"{NEON_AI_GATEWAY_BASE_URL.rstrip('/')}/v1/chat/completions"
     payload = {
         "model": model,
@@ -192,3 +182,4 @@ def query_neon_ai_gateway(prompt: str, model: str = "claude-3-5-sonnet") -> Dict
             }
     except Exception as e:
         return {"status": "error", "message": str(e)}
+

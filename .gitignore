@@ -1,8 +1,10 @@
 # Security & Credentials
+.env
+.env.*
+!.env.example
 *keys*.json
 *credentials*.json
 *secret*
-*.env
 *.pem
 *.key
 credentials/
