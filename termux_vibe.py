@@ -17,7 +17,7 @@ import time
 import re
 import urllib.request
 import urllib.parse
-from typing import List, Dict, Any, Optional
+from typing import List, Dict, Any
 
 try:
     if hasattr(sys.stdout, "reconfigure"):
