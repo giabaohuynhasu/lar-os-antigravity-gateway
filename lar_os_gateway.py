@@ -713,15 +713,14 @@ class CLIProxyWatchdog:
         self._total_restarts = 0
 
     def check_tcp_port(self) -> bool:
-        """Phase 8 L1 Process/Socket check: Non-blocking socket connect (0.15s timeout)."""
-        s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        s.settimeout(0.15)
-        try:
-            return s.connect_ex((self.host, self.port)) == 0
-        except Exception:
-            return False
-        finally:
-            s.close()
+        import socket
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+            s.settimeout(0.5)
+            try:
+                s.connect(("127.0.0.1", self.port))
+                return True
+            except (ConnectionRefusedError, socket.timeout):
+                return False
 
     async def start(self) -> None:
         if self._task is not None and not self._task.done():
