@@ -125,7 +125,8 @@ def get_config():
         try:
             with open(CONFIG_PATH, "r", encoding="utf-8") as f:
                 return json.load(f)
-        except Exception:
+        except Exception as e:
+            print(f"Error loading config: {e}")
             pass
     return {
         "gateway": {"port": 18797, "host": "127.0.0.1", "auth_token": "lar-os-master"}
