@@ -1,5 +1,4 @@
 import unittest
-import json
 import time
 from neon_bridge import (
     init_neon_database,
