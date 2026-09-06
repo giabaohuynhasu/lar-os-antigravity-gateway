@@ -67,5 +67,63 @@ class TestGoogleDriveConnector(unittest.TestCase):
         self.assertEqual(mock_mkdir.call_count, 2)
         mock_mkdir.assert_called_with(parents=True, exist_ok=True)
 
+    @patch("google_drive_connector.Path.exists")
+    @patch("google_drive_connector.Path.mkdir")
+    @patch("google_drive_connector.Path.glob")
+    def test_list_drive_research_files_connected(self, mock_glob, mock_mkdir, mock_exists):
+        mock_exists.return_value = True
+
+        connector = GoogleDriveConnector()
+
+        # Mocking the glob method on Path
+        mock_file1 = MagicMock()
+        mock_file1.is_file.return_value = True
+        mock_file1.name = "test_file_1.pdf"
+        mock_file1.__str__.return_value = str(connector.drive_root / "test_file_1.pdf")
+        mock_stat1 = MagicMock()
+        mock_stat1.st_size = 1024
+        mock_stat1.st_mtime = 1672531200 # 2023-01-01 00:00:00
+        mock_file1.stat.return_value = mock_stat1
+
+        mock_file2 = MagicMock()
+        mock_file2.is_file.return_value = True
+        mock_file2.name = "test_file_2.docx"
+        mock_file2.__str__.return_value = str(connector.drive_root / "test_file_2.docx")
+        mock_stat2 = MagicMock()
+        mock_stat2.st_size = 2048
+        mock_stat2.st_mtime = 1672617600
+        mock_file2.stat.return_value = mock_stat2
+
+        mock_dir = MagicMock()
+        mock_dir.is_file.return_value = False
+
+        mock_glob.return_value = [mock_file1, mock_dir, mock_file2]
+
+        results = connector.list_drive_research_files(limit=10)
+
+        self.assertEqual(len(results), 2)
+        self.assertEqual(results[0]["name"], "test_file_1.pdf")
+        self.assertEqual(results[0]["size_bytes"], 1024)
+        self.assertEqual(results[0]["path"], str(connector.drive_root / "test_file_1.pdf"))
+        self.assertEqual(results[1]["name"], "test_file_2.docx")
+        self.assertEqual(results[1]["size_bytes"], 2048)
+        self.assertEqual(results[1]["path"], str(connector.drive_root / "test_file_2.docx"))
+
+        # Test limit
+        mock_glob.return_value = [mock_file1, mock_dir, mock_file2]
+        results_limited = connector.list_drive_research_files(limit=1)
+        self.assertEqual(len(results_limited), 1)
+        self.assertEqual(results_limited[0]["name"], "test_file_1.pdf")
+
+    @patch("google_drive_connector.Path.exists")
+    def test_list_drive_research_files_disconnected(self, mock_exists):
+        mock_exists.return_value = False
+
+        connector = GoogleDriveConnector()
+
+        results = connector.list_drive_research_files()
+
+        self.assertEqual(results, [])
+
 if __name__ == '__main__':
     unittest.main()
