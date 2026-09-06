@@ -30,7 +30,10 @@ HANDOFF_FILE = BASE_DIR / "STATE_HANDOFF.json"
 LEDGER_FILE = BASE_DIR / "HANDOVER_LEDGER.jsonl"
 PROMPT_FILE = BASE_DIR / "CONTINUITY_PROMPT.md"
 
-SHARED_SECRET = b"LAR_OS_AHCP_V1_ANTIGRAVITY_SHARED_KEY_2026"
+_secret = os.getenv("LAR_OS_AHCP_SHARED_SECRET")
+if not _secret:
+    raise ValueError("LAR_OS_AHCP_SHARED_SECRET environment variable is not set.")
+SHARED_SECRET = _secret.encode("utf-8")
 
 
 def compute_signature(payload_dict: Dict[str, Any]) -> str:
