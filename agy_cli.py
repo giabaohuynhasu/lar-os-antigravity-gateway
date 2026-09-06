@@ -58,11 +58,11 @@ def print_banner():
 
 def check_gateway_health() -> Dict[str, Any]:
     try:
-        req = urllib.request.Request(f"{GATEWAY_URL}/health")
-        with urllib.request.urlopen(req, timeout=3) as resp:
-            return json.loads(resp.read().decode("utf-8"))
-    except Exception as e:
-        return {"status": "OFFLINE", "error": str(e)}
+        req = urllib.request.Request(f"{GATEWAY_URL}/health", headers={"User-Agent": "AgyCLI"})
+        with urllib.request.urlopen(req, timeout=1.5) as resp:
+            return json.loads(resp.read().decode())
+    except Exception:
+        return {"status": "error"}
 
 def check_opera_neon_health() -> Dict[str, Any]:
     try:
