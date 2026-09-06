@@ -198,12 +198,12 @@ class TelemetryEvent:
     state: Optional[int] = None
     value: Optional[int] = None
 
-class TelemetryStore:
+class TelemetryWorker:
     def __init__(self, db_path: Path):
         self.db_path = str(db_path)
-        self.queue: queue.Queue = queue.Queue(maxsize=TELEMETRY_MAX_QUEUE)
-        self._stop = threading.Event()
-        self._thread = threading.Thread(
+        self._queue: queue.Queue = queue.Queue(maxsize=TELEMETRY_MAX_QUEUE)
+        self._running = False
+        self._worker_thread = threading.Thread(
             target=self._writer_loop,
             name="laros-telemetry",
             daemon=True
@@ -212,8 +212,9 @@ class TelemetryStore:
         self._insert_count = 0
 
     def start(self):
-        if not self._thread.is_alive():
-            self._thread.start()
+        if not self._worker_thread.is_alive():
+            self._running = True
+            self._worker_thread.start()
 
     def emit(
         self,
@@ -232,14 +233,15 @@ class TelemetryStore:
             value=int(value) if value is not None else None,
         )
         try:
-            self.queue.put_nowait(event)
+            self._queue.put_nowait(event)
         except queue.Full:
             self.dropped_events += 1
 
     def stop(self):
-        self._stop.set()
-        if self._thread.is_alive():
-            self._thread.join(timeout=2.0)
+        """Dừng telemetry worker gracefully."""
+        self._running = False
+        self._queue.put(None)
+        self._worker_thread.join(timeout=2.0)
 
     def _open(self):
         conn = sqlite3.connect(
@@ -274,22 +276,28 @@ class TelemetryStore:
             conn = self._open()
             while True:
                 try:
-                    first = self.queue.get(timeout=0.5)
+                    first = self._queue.get(timeout=0.5)
+                    if first is None:
+                        break
                 except queue.Empty:
-                    if self._stop.is_set():
+                    if not self._running:
                         break
                     continue
 
                 batch = [first]
                 while len(batch) < TELEMETRY_BATCH_SIZE:
                     try:
-                        batch.append(self.queue.get_nowait())
+                        next_event = self._queue.get_nowait()
+                        if next_event is None:
+                            self._running = False
+                            break
+                        batch.append(next_event)
                     except queue.Empty:
                         break
 
                 self._write_batch(conn, batch)
                 for _ in batch:
-                    self.queue.task_done()
+                    self._queue.task_done()
         except Exception:
             pass
         finally:
@@ -431,7 +439,7 @@ class TelemetryStore:
             pass
         return results
 
-telemetry_store = TelemetryStore(TELEMETRY_DB_PATH)
+telemetry_store = TelemetryWorker(TELEMETRY_DB_PATH)
 
 # ==========================================
 # 2. RTK PROMPT COMPACTOR (from 9router)
