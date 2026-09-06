@@ -10,6 +10,7 @@ Features:
 - Strips routing noise so models receive pure, clean instructions.
 """
 
+import os
 import re
 import sys
 import unicodedata
