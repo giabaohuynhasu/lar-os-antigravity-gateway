@@ -1,7 +1,12 @@
 import unittest
+import os
 import json
 import tempfile
 from pathlib import Path
+
+# Set dummy secret before importing antigravity_state_bridge to avoid ValueError during import
+os.environ["LAR_OS_AHCP_SHARED_SECRET"] = "DUMMY_SECRET_FOR_TESTING"
+
 from antigravity_state_bridge import compute_signature, create_state_snapshot, verify_handoff_state, HANDOFF_FILE
 
 class TestAntigravityStateBridge(unittest.TestCase):
