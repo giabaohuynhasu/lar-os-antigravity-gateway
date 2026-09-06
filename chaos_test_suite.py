@@ -12,7 +12,6 @@ Tests 100% locally with Zero-Framework (Pure Python Standard Library):
 import sys
 import time
 import json
-import socket
 import subprocess
 import urllib.request
 import urllib.error
