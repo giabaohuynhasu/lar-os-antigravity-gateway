@@ -32,6 +32,13 @@ GATEWAY_URL = "http://127.0.0.1:18797"
 
 RECIPIENT_EMAIL = "thuaquan228@gmail.com"
 
+def strip_markdown(text: str) -> str:
+    """Loại bỏ bớt markdown để hiển thị trên terminal nếu cần."""
+    import re
+    text = re.sub(r'\*\*(.*?)\*\*', r'\1', text)
+    text = re.sub(r'_(.*?)_', r'\1', text)
+    return text
+
 # Terminal Color Codes
 class Colors:
     BLUE = "\033[94m"
