@@ -35,7 +35,6 @@ if not PYTHON_EXE.exists():
 
 from lar_os_nuclear_watcher import (
     NuclearWatcher,
-    IncidentFSM,
     get_windows_process_creation_time,
     verify_process_incarnation,
     HEARTBEAT_FILE,
