@@ -1,6 +1,5 @@
 import asyncio
 import sys
-import json
 from opera_neon_ai_bridge import get_bridge
 
 if sys.platform.startswith("win"):
