@@ -53,6 +53,15 @@ class TestAntiCrashGuard(unittest.TestCase):
         self.assertFalse(success)
         self.assertIn("Connection refused", error_msg)
 
+    @patch("anti_crash_guard.urllib.request.urlopen")
+    def test_check_gateway_health_timeout(self, mock_urlopen):
+        mock_urlopen.side_effect = URLError("Gateway Timeout")
+
+        success, error_msg = anti_crash_guard.check_gateway_health()
+
+        self.assertFalse(success)
+        self.assertIn("Gateway Timeout", error_msg)
+
     @patch("builtins.print")
     @patch("anti_crash_guard.shutil.disk_usage")
     @patch("anti_crash_guard.check_gateway_health")
