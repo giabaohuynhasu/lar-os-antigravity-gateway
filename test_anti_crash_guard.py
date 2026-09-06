@@ -31,6 +31,21 @@ class TestAntiCrashGuard(unittest.TestCase):
         self.assertEqual(deleted_count, 1)
         mock_rmtree.assert_called_once_with(mock_dir_temp, ignore_errors=True)
 
+    @patch("anti_crash_guard.shutil.rmtree")
+    @patch.object(Path, "iterdir")
+    def test_clean_temp_sandboxes_exception(self, mock_iterdir, mock_rmtree):
+        mock_dir_temp = MagicMock()
+        mock_dir_temp.is_dir.return_value = True
+        mock_dir_temp.name = "temp_error"
+
+        mock_iterdir.return_value = [mock_dir_temp]
+        mock_rmtree.side_effect = Exception("Permission denied")
+
+        deleted_count = anti_crash_guard.clean_temp_sandboxes()
+
+        self.assertEqual(deleted_count, 0)
+        mock_rmtree.assert_called_once_with(mock_dir_temp, ignore_errors=True)
+
     @patch("anti_crash_guard.urllib.request.urlopen")
     def test_check_gateway_health_success(self, mock_urlopen):
         mock_response = MagicMock()
@@ -52,6 +67,27 @@ class TestAntiCrashGuard(unittest.TestCase):
         
         self.assertFalse(success)
         self.assertIn("Connection refused", error_msg)
+
+    @patch("anti_crash_guard.urllib.request.urlopen")
+    def test_check_gateway_health_timeout(self, mock_urlopen):
+        import socket
+        mock_urlopen.side_effect = socket.timeout("timed out")
+
+        success, error_msg = anti_crash_guard.check_gateway_health()
+
+        self.assertFalse(success)
+        self.assertIn("timed out", error_msg)
+
+    @patch("anti_crash_guard.urllib.request.urlopen")
+    def test_check_gateway_health_json_decode_error(self, mock_urlopen):
+        mock_response = MagicMock()
+        mock_response.read.return_value = b'{"status": "ok", "active_keys": ' # Invalid JSON
+        mock_urlopen.return_value.__enter__.return_value = mock_response
+
+        success, error_msg = anti_crash_guard.check_gateway_health()
+
+        self.assertFalse(success)
+        self.assertTrue(isinstance(error_msg, str))
 
     @patch("builtins.print")
     @patch("anti_crash_guard.shutil.disk_usage")
