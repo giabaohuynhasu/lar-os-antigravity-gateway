@@ -37,6 +37,7 @@ class TestGoogleDriveConnector(unittest.TestCase):
         status = connector.get_status()
         self.assertEqual(status["status"], "DISCONNECTED")
         self.assertEqual(status["message"], "Google Drive for PC not mounted on G:")
+
     @patch('sys.stdout', new_callable=MagicMock)
     @patch("google_drive_connector.Path.exists")
     @patch("google_drive_connector.Path.mkdir")
@@ -65,6 +66,7 @@ class TestGoogleDriveConnector(unittest.TestCase):
         # Note: mkdir is called in __init__ for workspace_dir and in sync_file_to_drive for dest_dir
         self.assertEqual(mock_mkdir.call_count, 2)
         mock_mkdir.assert_called_with(parents=True, exist_ok=True)
+
 
 if __name__ == '__main__':
     unittest.main()
