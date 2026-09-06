@@ -5,6 +5,7 @@ Direct SSH Bridge to Google Cloud Shell Distributed Worker Nodes
 import subprocess
 import sys
 from pathlib import Path
+from typing import Dict, Any
 
 SSH_KEY = Path.home() / ".ssh" / "google_compute_engine"
 
@@ -43,6 +44,14 @@ def run_remote_command(cmd: str, node_name="thuaquan228"):
     ]
     res = subprocess.run(ssh_args, capture_output=True, text=True, encoding="utf-8")
     return res.returncode, res.stdout, res.stderr
+
+def get_session_info() -> Dict[str, Any]:
+    try:
+        out = subprocess.check_output(["tmux", "display-message", "-p", "#{session_id}:#{window_index}"], stderr=subprocess.DEVNULL)
+        parts = out.decode("utf-8").strip().split(":")
+        return {"session": parts[0], "window": parts[1]}
+    except Exception:
+        return {"session": "unknown", "window": "unknown"}
 
 def run_remote_python(code: str, node_name="thuaquan228"):
     """Pipe Python code directly into Python3 on a specific remote Cloud Shell node."""
