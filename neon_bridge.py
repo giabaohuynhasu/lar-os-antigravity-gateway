@@ -13,7 +13,7 @@ import sys
 import json
 import time
 import urllib.request
-from typing import Dict, Any, Optional, List
+from typing import Dict, Any, Optional
 from pathlib import Path
 
 try:
