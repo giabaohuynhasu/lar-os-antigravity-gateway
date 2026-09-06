@@ -9,7 +9,6 @@ import os
 import sys
 import json
 import asyncio
-from pathlib import Path
 
 if sys.platform.startswith("win"):
     sys.stdout.reconfigure(encoding="utf-8")
