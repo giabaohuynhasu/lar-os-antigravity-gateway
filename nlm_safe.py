@@ -3,6 +3,7 @@ LAR-OS Safe NotebookLM CLI Wrapper (Just-In-Time Auto-Authentication)
 Ensures credentials are valid before executing any nlm command.
 No background heartbeats needed.
 """
+import os
 import subprocess
 import sys
 from pathlib import Path
@@ -11,6 +12,11 @@ NLM_PATH = Path(r"C:\Users\nswcl\.local\bin\nlm.exe")
 
 def ensure_authenticated():
     """Checks if nlm credentials are valid; if not, automatically re-authenticates."""
+    api_key = os.environ.get("GEMINI_API_KEY")
+    if not api_key:
+        print("[!] Không tìm thấy GEMINI_API_KEY. Vui lòng thiết lập biến môi trường này.")
+        sys.exit(1)
+
     check_res = subprocess.run(
         [str(NLM_PATH), "login", "--check"],
         capture_output=True,
