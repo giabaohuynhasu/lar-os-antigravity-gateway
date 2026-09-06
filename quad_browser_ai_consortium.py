@@ -5,11 +5,8 @@ Role: Query Perplexity (Comet:9222), Copilot (Edge:9223), Gemini (Chrome:9224), 
 Zero-Quota, Multi-Engine Parallel Consensus Architecture.
 """
 
-import os
 import sys
-import json
 import asyncio
-from pathlib import Path
 
 if sys.platform.startswith("win"):
     sys.stdout.reconfigure(encoding="utf-8")
