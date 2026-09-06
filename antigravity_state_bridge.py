@@ -196,8 +196,15 @@ def verify_handoff_state() -> bool:
         print("[-] Error: STATE_HANDOFF.json does not exist.")
         return False
 
-    with open(HANDOFF_FILE, "r", encoding="utf-8") as f:
-        package = json.load(f)
+    try:
+        with open(HANDOFF_FILE, "r", encoding="utf-8") as f:
+            package = json.load(f)
+    except json.JSONDecodeError:
+        print("[-] Error: STATE_HANDOFF.json is malformed or invalid JSON.")
+        return False
+    except Exception as e:
+        print(f"[-] Error reading STATE_HANDOFF.json: {e}")
+        return False
 
     header = package.get("header", {})
     payload = package.get("payload", {})
