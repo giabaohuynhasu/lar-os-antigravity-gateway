@@ -35,9 +35,13 @@ def ensure_authenticated():
         return False
 
 def run_nlm(args):
-    """Run an nlm command with automatic JIT authentication."""
+    """Executes a notebooklm agent step securely."""
     if not ensure_authenticated():
         sys.exit(1)
+
+    if not args:
+        print("Sử dụng: nlm_safe.py <lệnh>")
+        return
 
     cmd = [str(NLM_PATH)] + args
     res = subprocess.run(cmd)
