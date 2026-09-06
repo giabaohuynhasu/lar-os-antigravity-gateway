@@ -38,8 +38,7 @@ from lar_os_nuclear_watcher import (
     IncidentFSM,
     get_windows_process_creation_time,
     verify_process_incarnation,
-    HEARTBEAT_FILE,
-    STATE_FILE
+    HEARTBEAT_FILE
 )
 
 GATEWAY_URL = "http://127.0.0.1:18797"
