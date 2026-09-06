@@ -185,6 +185,8 @@ PROVIDER_CODE_MAP = {
 }
 
 def get_provider_code(name: str) -> int:
+    if not isinstance(name, str) or not name.strip():
+        return 0
     if name in PROVIDER_CODE_MAP:
         return PROVIDER_CODE_MAP[name]
     return 10 + (abs(hash(name)) % 90)
