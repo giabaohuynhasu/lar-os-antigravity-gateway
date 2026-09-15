@@ -10,6 +10,9 @@ class TestAntigravityStateBridge(unittest.TestCase):
         d2 = {"b": "test", "a": 1}
         self.assertEqual(compute_signature(d1), compute_signature(d2))
 
+    def test_compute_signature_empty_dict(self):
+        self.assertIsInstance(compute_signature({}), str)
+
     def test_signature_tamper_detection(self):
         d = {"a": 1}
         sig = compute_signature(d)
