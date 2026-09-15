@@ -115,7 +115,7 @@ class GoogleAIStudioClient:
                 with urllib.request.urlopen(req, timeout=20) as resp:
                     if resp.status == 200:
                         data = json.loads(resp.read().decode("utf-8"))
-                        text = data["candidates"][0]["content"]["parts"][0]["text"]
+                        text = extract_text(data)
                         return {
                             "text": text,
                             "model": target_model,
@@ -189,6 +189,14 @@ Propose a valid ResearchObject JSON conforming to the sandbox.py template:
         if text.endswith("```"):
             text = text[:-3]
         return json.loads(text.strip())
+
+
+def extract_text(data: Dict[str, Any]) -> str:
+    """Safely extracts text from a Gemini API response structure."""
+    try:
+        return data["candidates"][0]["content"]["parts"][0]["text"]
+    except Exception as e:
+        return f"(Error parsing response: {e})"
 
 
 # Default singleton instance
