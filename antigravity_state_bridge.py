@@ -191,16 +191,20 @@ Acknowledge receipt of this handover, verify state integrity, and report readine
 
 
 def verify_handoff_state() -> bool:
-    """Verifies cryptographic integrity of the current handoff file."""
+    """
+    Reads STATE_HANDOFF.json and verifies the integrity signature.
+    """
     if not HANDOFF_FILE.exists():
         print("[-] Error: STATE_HANDOFF.json does not exist.")
         return False
+    try:
+        data = json.loads(HANDOFF_FILE.read_text(encoding='utf-8'))
+    except Exception as e:
+        print(f"[-] Error parsing JSON: {e}")
+        return False
 
-    with open(HANDOFF_FILE, "r", encoding="utf-8") as f:
-        package = json.load(f)
-
-    header = package.get("header", {})
-    payload = package.get("payload", {})
+    header = data.get("header", {})
+    payload = data.get("payload", {})
     recorded_sig = header.get("signature", "")
     computed_sig = compute_signature(payload)
 
