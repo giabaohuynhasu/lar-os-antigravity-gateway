@@ -4,6 +4,7 @@ Author: Gia Bao Huynh (Jun) / Antigravity
 """
 
 import unittest
+from unittest.mock import patch, MagicMock
 import asyncio
 import json
 import time
@@ -70,10 +71,29 @@ class TestGmailSparkSender(unittest.TestCase):
     def setUp(self):
         self.sender = GmailSparkSender(port=9224)
 
-    def test_gmail_tab_discovery(self):
+    @patch("urllib.request.urlopen")
+    def test_gmail_tab_discovery(self, mock_urlopen):
+        mock_response = MagicMock()
+        mock_response.read.return_value = json.dumps([
+            {"url": "https://mail.google.com/mail/u/0/", "type": "page"}
+        ]).encode("utf-8")
+        mock_response.__enter__.return_value = mock_response
+        mock_urlopen.return_value = mock_response
+
         tab = self.sender.get_or_open_gmail_tab()
         self.assertIsNotNone(tab, "Gmail tab should be detected on Opera Neon CDP")
         self.assertIn("mail.google.com", tab.get("url", ""))
+
+    @patch("urllib.request.urlopen")
+    def test_get_or_open_gmail_tab_error(self, mock_urlopen):
+        # Simulate connection refused or other error
+        mock_urlopen.side_effect = Exception("Connection refused")
+
+        # Test error handling when getting/opening tab
+        tab = self.sender.get_or_open_gmail_tab()
+
+        # Ensure it safely catches the error and returns None
+        self.assertIsNone(tab, "Should return None on exception")
 
 class TestGeminiSparkDaemon(unittest.TestCase):
     def setUp(self):

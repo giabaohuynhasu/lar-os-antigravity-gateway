@@ -11,3 +11,4 @@
 {"event": "STATE_HANDOFF_CREATED", "timestamp": "2026-09-04T02:02:49.323281+00:00", "source_instance": "TEST-INSTANCE-01", "signature": "fa0cad12938a12466e9d794b15053730cafe0bad9f2770577a64f1b0c69d892a", "reason": "Unit test execution"}
 {"event": "STATE_HANDOFF_CREATED", "timestamp": "2026-09-04T02:55:54.514419+00:00", "source_instance": "TEST-INSTANCE-01", "signature": "27b36113bde606edab0c1baec55725dc5ac6ba011c8f10fc6c488f2956ef009c", "reason": "Unit test execution"}
 {"event": "STATE_HANDOFF_CREATED", "timestamp": "2026-09-04T03:16:02.517907+00:00", "source_instance": "TEST-INSTANCE-01", "signature": "b7df964dc6d294a2279c57a8cc19129ac94217cdf92ad4f31c85844acd76cfc3", "reason": "Unit test execution"}
+{"event": "STATE_HANDOFF_CREATED", "timestamp": "2026-09-15T07:38:57.357214+00:00", "source_instance": "TEST-INSTANCE-01", "signature": "90ef774901697c5a2aee05ab37e1931de51be5ac9c6d14ae7c6e6f4e001bc5fa", "reason": "Unit test execution"}
