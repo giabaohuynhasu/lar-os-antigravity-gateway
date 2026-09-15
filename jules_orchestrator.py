@@ -36,6 +36,7 @@ DEFAULT_SOURCE = "sources/github/giabaohuynhasu/lar-os-antigravity-gateway"
 
 class JulesOrchestrator:
     def __init__(self):
+        self.keys_file = Path('jules_keys.json')
         self.keys = self._load_keys()
         self._round_robin_idx = 0
 
@@ -45,24 +46,21 @@ class JulesOrchestrator:
         if env_key:
             return [{"account": "env_user", "api_key": env_key, "agent_role": "PRIMARY_WORKER", "status": "ACTIVE"}]
 
-        # 2. Try jules_keys.json
-        if KEYS_FILE.exists():
-            try:
-                with open(KEYS_FILE, "r", encoding="utf-8") as f:
-                    data = json.load(f)
-                    return [k for k in data.get("jules_keys", []) if k.get("status") == "ACTIVE"]
-            except Exception as e:
-                print(f"[!] Error loading jules_keys.json: {e}")
+        # 2. Try to load from self.keys_file
+        try:
+            data = json.loads(self.keys_file.read_text(encoding='utf-8'))
 
-        # 3. Fallback to local config if present
-        local_keys = Path("jules_keys.json")
-        if local_keys.exists():
-            try:
-                with open(local_keys, "r", encoding="utf-8") as f:
-                    data = json.load(f)
-                    return [k for k in data.get("jules_keys", []) if k.get("status") == "ACTIVE"]
-            except Exception:
-                pass
+            # The prompt requested logic:
+            if not isinstance(data, list):
+                data = [data] # Fallback if single dict
+
+            # Status filtering and backwards compatibility if it's a dict containing "jules_keys"
+            if len(data) == 1 and isinstance(data[0], dict) and "jules_keys" in data[0]:
+                data = data[0].get("jules_keys", [])
+
+            return [k for k in data if k.get("status") == "ACTIVE"]
+        except Exception as e:
+            print(f"[JulesOrchestrator] Failed to load keys: {e}")
 
         return []
 
