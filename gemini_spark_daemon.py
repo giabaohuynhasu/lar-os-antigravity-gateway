@@ -51,18 +51,19 @@ class GeminiSparkDaemon:
         }
         
         req_data = json.dumps(payload).encode("utf-8")
-        req = urllib.request.Request(
-            GATEWAY_API_URL,
-            data=req_data,
-            headers={"Content-Type": "application/json", "Authorization": "Bearer lar-os-spark-key"}
-        )
-        
         try:
-            with urllib.request.urlopen(req, timeout=45) as resp:
-                data = json.loads(resp.read().decode("utf-8"))
-                return data["choices"][0]["message"]["content"]
+            req = urllib.request.Request(
+                GATEWAY_API_URL,
+                data=req_data,
+                headers={"Content-Type": "application/json", "Authorization": "Bearer lar-os-spark-key"},
+                method="POST"
+            )
+            with urllib.request.urlopen(req, timeout=30) as response:
+                resp_data = json.loads(response.read().decode('utf-8'))
+                return resp_data.get("response", "(No response content)")
         except Exception as e:
-            return f"[Error contacting LAR-OS Gateway: {e}. Output generated locally.]"
+            print(f"[Daemon] Failed to call gateway AI: {e}")
+            return f"[Error] Gateway call failed: {str(e)}"
 
     def format_html_report(self, title: str, prompt: str, ai_response: str) -> str:
         """Formats the response into a sleek, professional HTML email report."""
