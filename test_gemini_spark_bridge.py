@@ -10,6 +10,8 @@ import time
 from pathlib import Path
 import tempfile
 import sys
+import urllib.error
+from unittest.mock import patch, MagicMock
 
 GATEWAY_DIR = Path(__file__).resolve().parent
 sys.path.insert(0, str(GATEWAY_DIR))
@@ -91,6 +93,23 @@ class TestGeminiSparkDaemon(unittest.TestCase):
         self.assertIn("thuaquan228@gmail.com", html)
         self.assertIn("Test Prompt", html)
         self.assertIn("Test Response Body", html)
+
+    @patch("urllib.request.urlopen")
+    def test_call_gateway_ai_success(self, mock_urlopen):
+        mock_response = MagicMock()
+        mock_response.read.return_value = json.dumps({"response": "Mocked successful response"}).encode('utf-8')
+        mock_urlopen.return_value.__enter__.return_value = mock_response
+
+        response = asyncio.run(self.daemon.call_gateway_ai("Hello"))
+        self.assertEqual(response, "Mocked successful response")
+
+    @patch("urllib.request.urlopen")
+    def test_call_gateway_ai_error(self, mock_urlopen):
+        mock_urlopen.side_effect = urllib.error.URLError("Network unreachable")
+
+        response = asyncio.run(self.daemon.call_gateway_ai("Hello"))
+        self.assertTrue(response.startswith("[Error] Gateway call failed:"))
+        self.assertIn("Network unreachable", response)
 
 if __name__ == "__main__":
     unittest.main()
