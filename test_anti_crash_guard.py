@@ -1,6 +1,8 @@
 import unittest
 from unittest.mock import patch, MagicMock
 import json
+import os
+import tempfile
 from urllib.error import URLError
 
 import anti_crash_guard
@@ -8,28 +10,24 @@ import anti_crash_guard
 from pathlib import Path
 
 class TestAntiCrashGuard(unittest.TestCase):
-    @patch("anti_crash_guard.shutil.rmtree")
-    @patch.object(Path, "iterdir")
-    def test_clean_temp_sandboxes(self, mock_iterdir, mock_rmtree):
-        # Create mock items
-        mock_dir_temp = MagicMock()
-        mock_dir_temp.is_dir.return_value = True
-        mock_dir_temp.name = "temp_123"
+    def test_clean_temp_sandboxes(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            temp_path = Path(temp_dir)
 
-        mock_dir_other = MagicMock()
-        mock_dir_other.is_dir.return_value = True
-        mock_dir_other.name = "other_dir"
+            # Create a mock environment
+            (temp_path / "temp_123").mkdir()
+            (temp_path / "other_dir").mkdir()
+            (temp_path / "temp_file.txt").touch()
 
-        mock_file = MagicMock()
-        mock_file.is_dir.return_value = False
-        mock_file.name = "temp_file.txt"
+            with patch("anti_crash_guard.SANDBOX_DIR", temp_path):
+                deleted_count = anti_crash_guard.clean_temp_sandboxes()
 
-        mock_iterdir.return_value = [mock_dir_temp, mock_dir_other, mock_file]
+                self.assertEqual(deleted_count, 1)
 
-        deleted_count = anti_crash_guard.clean_temp_sandboxes()
-
-        self.assertEqual(deleted_count, 1)
-        mock_rmtree.assert_called_once_with(mock_dir_temp, ignore_errors=True)
+                # Check what was deleted and what was kept
+                self.assertFalse((temp_path / "temp_123").exists())
+                self.assertTrue((temp_path / "other_dir").exists())
+                self.assertTrue((temp_path / "temp_file.txt").exists())
 
     @patch("anti_crash_guard.urllib.request.urlopen")
     def test_check_gateway_health_success(self, mock_urlopen):
@@ -67,7 +65,7 @@ class TestAntiCrashGuard(unittest.TestCase):
         
         mock_clean.assert_called_once()
         mock_health.assert_called_once()
-        mock_disk.assert_called_with(str(anti_crash_guard.SCRATCH_DIR))
+        mock_disk.assert_called_with(str(anti_crash_guard.SANDBOX_DIR))
         self.assertTrue(mock_print.called)
 
         # Reset mocks to test failure branch of health check
