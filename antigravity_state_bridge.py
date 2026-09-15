@@ -30,7 +30,14 @@ HANDOFF_FILE = BASE_DIR / "STATE_HANDOFF.json"
 LEDGER_FILE = BASE_DIR / "HANDOVER_LEDGER.jsonl"
 PROMPT_FILE = BASE_DIR / "CONTINUITY_PROMPT.md"
 
-SHARED_SECRET = b"LAR_OS_AHCP_V1_ANTIGRAVITY_SHARED_KEY_2026"
+import secrets
+
+_secret_str = os.environ.get("LAR_OS_AHCP_SHARED_SECRET")
+if _secret_str:
+    SHARED_SECRET = _secret_str.encode("utf-8")
+else:
+    # Secure fallback if not set in environment
+    SHARED_SECRET = secrets.token_bytes(32)
 
 
 def compute_signature(payload_dict: Dict[str, Any]) -> str:
