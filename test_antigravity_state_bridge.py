@@ -1,4 +1,5 @@
 import unittest
+from unittest.mock import patch
 import json
 import tempfile
 from pathlib import Path
@@ -22,6 +23,31 @@ class TestAntigravityStateBridge(unittest.TestCase):
         self.assertIn("payload", package)
         self.assertEqual(package["payload"]["source_instance"], "TEST-INSTANCE-01")
         self.assertTrue(verify_handoff_state())
+
+
+
+    @patch("antigravity_state_bridge.HANDOFF_FILE")
+    def test_verify_handoff_state_valid_signature(self, mock_handoff_file):
+        mock_handoff_file.exists.return_value = True
+        payload = {"a": 1}
+        sig = compute_signature(payload)
+        mock_handoff_file.read_text.return_value = json.dumps({"header": {"signature": sig}, "payload": payload})
+        self.assertTrue(verify_handoff_state())
+
+    @patch("antigravity_state_bridge.HANDOFF_FILE")
+    def test_verify_handoff_state_invalid_signature(self, mock_handoff_file):
+        mock_handoff_file.exists.return_value = True
+        invalid_data = {
+            "header": {"signature": "invalid_sig_123"},
+            "payload": {"a": 1}
+        }
+        mock_handoff_file.read_text.return_value = json.dumps(invalid_data)
+        self.assertFalse(verify_handoff_state())
+
+    @patch("antigravity_state_bridge.HANDOFF_FILE")
+    def test_verify_handoff_state_missing_file(self, mock_handoff_file):
+        mock_handoff_file.exists.return_value = False
+        self.assertFalse(verify_handoff_state())
 
 if __name__ == "__main__":
     unittest.main()
