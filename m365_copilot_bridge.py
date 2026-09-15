@@ -7,11 +7,9 @@ Role: Harness Microsoft 365 Copilot (ASU Educational License) via CDP port 9223
 
 import asyncio
 import json
-import os
 import sys
 import time
 import urllib.request
-from pathlib import Path
 from typing import Dict, Any, Optional
 
 if sys.platform.startswith("win"):
