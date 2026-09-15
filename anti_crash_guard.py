@@ -3,20 +3,24 @@ Anti-Crash Guard Daemon (ACP-V1)
 Fast and lightweight watchdog for system health, temporary sandboxes, and Gateway status.
 """
 import os
-import sys
+import time
 import shutil
-import subprocess
 import urllib.request
 import json
 from pathlib import Path
 
-SCRATCH_DIR = Path(r"C:\Users\nswcl\.gemini\antigravity-ide\scratch")
+SANDBOX_DIR = Path(__file__).resolve().parent / "sandboxes"
 GATEWAY_URL = "http://127.0.0.1:18797/health"
 
 def clean_temp_sandboxes():
-    """Prune temporary cloned user-data directories in scratch."""
+    """
+    Removes old or corrupted sandbox directories.
+    """
     deleted = 0
-    for item in SCRATCH_DIR.iterdir():
+    if not SANDBOX_DIR.exists():
+        return deleted
+
+    for item in SANDBOX_DIR.iterdir():
         if item.is_dir() and item.name.startswith("temp_"):
             try:
                 shutil.rmtree(item, ignore_errors=True)
@@ -54,7 +58,7 @@ def run_audit():
 
 
     # 3. Memory & Disk Health
-    total, used, free = shutil.disk_usage(str(SCRATCH_DIR))
+    total, used, free = shutil.disk_usage(str(SANDBOX_DIR))
     free_gb = free // (2**30)
     print(f"[3] Scratch Disk Free Space: {free_gb} GB", flush=True)
 
