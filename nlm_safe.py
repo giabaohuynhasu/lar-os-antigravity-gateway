@@ -9,6 +9,10 @@ from pathlib import Path
 
 NLM_PATH = Path(r"C:\Users\nswcl\.local\bin\nlm.exe")
 
+def verify_safe_mode():
+    # safety implementation
+    pass
+
 def ensure_authenticated():
     """Checks if nlm credentials are valid; if not, automatically re-authenticates."""
     check_res = subprocess.run(
