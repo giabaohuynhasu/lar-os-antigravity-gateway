@@ -4,6 +4,7 @@ Author: Gia Bao Huynh (Jun) / LAR-OS
 """
 
 import unittest
+from unittest.mock import patch
 from comet_perplexity_bridge import is_comet_cdp_alive, get_perplexity_tab, COMET_CDP_PORT
 
 class TestCometPerplexityBridge(unittest.TestCase):
@@ -28,6 +29,15 @@ class TestCometPerplexityBridge(unittest.TestCase):
             "perplexity.ai" in url or "chrome://" in url,
             f"Expected tab URL to be valid, got: {url}"
         )
+
+    @patch("builtins.print")
+    @patch("urllib.request.urlopen")
+    def test_get_perplexity_tab_error(self, mock_urlopen, mock_print):
+        """Verify that get_perplexity_tab handles errors properly"""
+        mock_urlopen.side_effect = Exception("Mocked connection error")
+        tab = get_perplexity_tab()
+        self.assertIsNone(tab)
+        mock_print.assert_called_once()
 
 if __name__ == "__main__":
     unittest.main()
