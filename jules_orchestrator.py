@@ -35,9 +35,15 @@ BASE_URL = "https://jules.googleapis.com/v1alpha"
 DEFAULT_SOURCE = "sources/github/giabaohuynhasu/lar-os-antigravity-gateway"
 
 class JulesOrchestrator:
+    """
+    Core orchestrator to delegate subagent tasks to Jules instances.
+    Handles authentication, context handoff, and synthesis.
+    """
     def __init__(self):
+        self.keys_file = Path(__file__).resolve().parent / "jules_keys.json"
         self.keys = self._load_keys()
         self._round_robin_idx = 0
+        self.active_sessions = {}
 
     def _load_keys(self) -> List[Dict[str, Any]]:
         # 1. Try environment variable
@@ -46,9 +52,9 @@ class JulesOrchestrator:
             return [{"account": "env_user", "api_key": env_key, "agent_role": "PRIMARY_WORKER", "status": "ACTIVE"}]
 
         # 2. Try jules_keys.json
-        if KEYS_FILE.exists():
+        if self.keys_file.exists():
             try:
-                with open(KEYS_FILE, "r", encoding="utf-8") as f:
+                with open(self.keys_file, "r", encoding="utf-8") as f:
                     data = json.load(f)
                     return [k for k in data.get("jules_keys", []) if k.get("status") == "ACTIVE"]
             except Exception as e:
