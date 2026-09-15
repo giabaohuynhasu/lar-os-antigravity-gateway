@@ -15,6 +15,7 @@ import os
 import sys
 import json
 import time
+import secrets
 import re
 import uuid
 import hashlib
@@ -128,7 +129,7 @@ def get_config():
         except Exception:
             pass
     return {
-        "gateway": {"port": 18797, "host": "127.0.0.1", "auth_token": "lar-os-master"}
+        "gateway": {"port": 18797, "host": "127.0.0.1", "auth_token": os.environ.get("GATEWAY_AUTH_TOKEN", secrets.token_hex(16))}
     }
 
 # ==========================================
