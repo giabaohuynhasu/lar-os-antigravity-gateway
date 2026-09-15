@@ -2,7 +2,7 @@ import unittest
 from unittest.mock import patch, MagicMock
 import json
 from pathlib import Path
-from google_ai_studio_client import GoogleAIStudioClient
+from google_ai_studio_client import GoogleAIStudioClient, extract_text
 
 class TestGoogleAIStudioClient(unittest.TestCase):
     def setUp(self):
@@ -73,6 +73,32 @@ class TestGoogleAIStudioClient(unittest.TestCase):
         self.assertEqual(ro["id"], "paper_test")
         self.assertTrue(ro["falsification_conditions"][0]["references_external_source"])
         self.assertEqual(ro["revisions"][0]["delta_type"], "narrowed")
+
+    def test_extract_text_edge_cases(self):
+        # Well-formed JSON
+        well_formed = {
+            "candidates": [{
+                "content": {
+                    "parts": [{"text": "Success"}]
+                }
+            }]
+        }
+        self.assertEqual(extract_text(well_formed), "Success")
+
+        # Edge cases: missing keys or empty collections
+        edge_cases = [
+            {},
+            {"candidates": []},
+            {"candidates": [{}]},
+            {"candidates": [{"content": {}}]},
+            {"candidates": [{"content": {"parts": []}}]},
+            {"candidates": [{"content": {"parts": [{}]}}]},
+            {"wrong_key": "value"}
+        ]
+
+        for case in edge_cases:
+            result = extract_text(case)
+            self.assertTrue(result.startswith("(Error parsing response:"))
 
 if __name__ == "__main__":
     unittest.main()
