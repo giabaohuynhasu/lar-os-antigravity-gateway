@@ -1110,10 +1110,7 @@ async def _isolated_provider_call(call_coro, timeout_sec: float) -> tuple[Option
 # ==========================================
 _round_robin_counter = 0
 
-async def execute_model_request(model: str, messages: List[Dict[str, Any]], tools: Optional[List[Dict[str, Any]]] = None) -> Dict[str, Any]:
-    STATS["total_requests"] += 1
-    
-    # 1. Parse prompt & system
+def _parse_messages_to_prompt(messages: List[Dict[str, Any]]) -> str:
     user_prompt = ""
     system_prompt = ""
     for m in messages:
@@ -1133,18 +1130,9 @@ async def execute_model_request(model: str, messages: List[Dict[str, Any]], tool
     if not user_prompt:
         user_prompt = "Hello from LAR-OS Gateway"
 
-    full_query = (system_prompt + "\n\n" + user_prompt).strip() if system_prompt else user_prompt
-    compacted_query, saved = rtk_compact_text(full_query)
-    telemetry_store.emit(kind=TelemetryKind.REQUEST, provider=0)
-    
-    # Check cache (only if no tools are invoked)
-    p_hash = hashlib.md5((compacted_query + "_" + str(tools)).encode("utf-8")).hexdigest()
-    cached = get_cached_response(p_hash)
-    if cached:
-        log_event(f"⚡ Cache Hit! Instant return (0ms latency, 0 quota used).")
-        return cached
+    return (system_prompt + "\n\n" + user_prompt).strip() if system_prompt else user_prompt
 
-    # Browser bridges fallback
+async def _handle_special_models(model: str, compacted_query: str, tools: Optional[List[Dict[str, Any]]], p_hash: str) -> Optional[Dict[str, Any]]:
     model_lower = model.lower()
     if "quad" in model_lower and dispatch_quad_ai_search:
         res = await dispatch_quad_ai_search(compacted_query)
@@ -1185,7 +1173,9 @@ async def execute_model_request(model: str, messages: List[Dict[str, Any]], tool
                 return {"text": ans_text, "tool_calls": []}
             log_event(f"[-] Claude/Opera bridge error: {exc}")
 
-    # Core Gemini Multi-Account Pool
+    return None
+
+def _load_gemini_keys_pool() -> List[Dict[str, str]]:
     keys_pool = []
     if KEYS_FILE.exists():
         try:
@@ -1202,13 +1192,9 @@ async def execute_model_request(model: str, messages: List[Dict[str, Any]], tool
     if env_k and not any(x["key"] == env_k for x in keys_pool):
         keys_pool.append({"key": env_k, "account": "ENV_DEFAULT"})
 
-    if not keys_pool:
-        return {"text": "[LAR-OS Gateway Error] No active Google API keys found.", "tool_calls": []}
+    return keys_pool
 
-    global _round_robin_counter
-    target_model = "gemini-3.5-flash-lite" if ("flash" in model or "2.5" in model or "claude" in model) else model
-    
-    # Dynamic Priority Selection via Adaptive Health Scoring (Phase 3 & 4)
+async def _score_and_sort_keys(keys_pool: List[Dict[str, str]]) -> List[Dict[str, str]]:
     scored_keys = []
     for k in keys_pool:
         cb = get_circuit(k["account"])
@@ -1217,140 +1203,147 @@ async def execute_model_request(model: str, messages: List[Dict[str, Any]], tool
             if s > 0:
                 scored_keys.append((s, k))
 
-    # Highest health score first (fastest, most reliable provider)
     scored_keys.sort(key=lambda x: x[0], reverse=True)
-    ordered_pool = [k for _, k in scored_keys]
+    return [k for _, k in scored_keys]
 
-    # Convert tools if provided
-    gemini_tools = translate_anthropic_tools_to_gemini(tools) if tools else None
-
-    def _do_request_sync(k: str, m: str, p: str, g_tools: Optional[List[Dict[str, Any]]]):
-        u = f"https://generativelanguage.googleapis.com/v1beta/models/{m}:generateContent?key={k}"
-        payload: Dict[str, Any] = {
-            "contents": [{"parts": [{"text": p}]}],
-            "generationConfig": {
-                "maxOutputTokens": 2048,
-                "temperature": 0.2
-            }
+def _do_request_sync(k: str, m: str, p: str, g_tools: Optional[List[Dict[str, Any]]]) -> Optional[Dict[str, Any]]:
+    u = f"https://generativelanguage.googleapis.com/v1beta/models/{m}:generateContent?key={k}"
+    payload: Dict[str, Any] = {
+        "contents": [{"parts": [{"text": p}]}],
+        "generationConfig": {
+            "maxOutputTokens": 2048,
+            "temperature": 0.2
         }
-        if g_tools:
-            payload["tools"] = g_tools
-            
-        d = json.dumps(payload).encode("utf-8")
-        req = urllib.request.Request(u, data=d, headers={"Content-Type": "application/json"}, method="POST")
-        r = None
-        try:
-            r = urllib.request.urlopen(req, timeout=5)
-            if r.status == 200:
-                data = json.loads(r.read().decode("utf-8"))
-                cand = data.get("candidates", [{}])[0]
-                parts = cand.get("content", {}).get("parts", [])
-                
-                resp_text = ""
-                tool_calls = []
-                for part in parts:
-                    if "text" in part:
-                        resp_text += part["text"]
-                    elif "functionCall" in part:
-                        fc = part["functionCall"]
-                        tool_calls.append({
-                            "name": fc.get("name"),
-                            "args": fc.get("args", {})
-                        })
-                return {"text": resp_text, "tool_calls": tool_calls}
-        finally:
-            if r is not None:
-                with contextlib.suppress(Exception):
-                    r.close()
-        return None
+    }
+    if g_tools:
+        payload["tools"] = g_tools
 
-    # Monotonic deadline budget & Decorrelated Jitter state (Phase 7)
-    deadline = time.monotonic() + REQUEST_BUDGET_SEC
+    d = json.dumps(payload).encode("utf-8")
+    req = urllib.request.Request(u, data=d, headers={"Content-Type": "application/json"}, method="POST")
+    r = None
+    try:
+        r = urllib.request.urlopen(req, timeout=5)
+        if r.status == 200:
+            data = json.loads(r.read().decode("utf-8"))
+            cand = data.get("candidates", [{}])[0]
+            parts = cand.get("content", {}).get("parts", [])
+            
+            resp_text = ""
+            tool_calls = []
+            for part in parts:
+                if "text" in part:
+                    resp_text += part["text"]
+                elif "functionCall" in part:
+                    fc = part["functionCall"]
+                    tool_calls.append({
+                        "name": fc.get("name"),
+                        "args": fc.get("args", {})
+                    })
+            return {"text": resp_text, "tool_calls": tool_calls}
+    finally:
+        if r is not None:
+            with contextlib.suppress(Exception):
+                r.close()
+    return None
+
+async def _execute_primary_routing_loop(
+    ordered_pool: List[Dict[str, str]],
+    target_model: str,
+    compacted_query: str,
+    gemini_tools: Optional[List[Dict[str, Any]]],
+    deadline: float,
+    saved: int,
+    p_hash: str
+) -> Optional[Dict[str, Any]]:
     previous_delay = 0.25
     hop_count = 0
 
-    if ordered_pool:
-        for key_entry in ordered_pool:
-            if hop_count >= MAX_FAILOVER_HOPS:
-                break
-            remaining = deadline - time.monotonic()
-            if remaining <= 2.0:
-                break
+    for key_entry in ordered_pool:
+        if hop_count >= MAX_FAILOVER_HOPS:
+            break
+        remaining = deadline - time.monotonic()
+        if remaining <= 2.0:
+            break
 
-            acc = key_entry["account"]
-            cb = get_circuit(acc)
-            hop_count += 1
-            gateway_heartbeat.record_activity(acc, hop_count)
-            t_start = time.monotonic()
-            call_timeout = min(4.5, remaining)
-            res_dict, call_exc = await _isolated_provider_call(
-                asyncio.to_thread(_do_request_sync, key_entry["key"], target_model, compacted_query, gemini_tools),
-                timeout_sec=call_timeout
+        acc = key_entry["account"]
+        cb = get_circuit(acc)
+        hop_count += 1
+        gateway_heartbeat.record_activity(acc, hop_count)
+        t_start = time.monotonic()
+        call_timeout = min(4.5, remaining)
+        res_dict, call_exc = await _isolated_provider_call(
+            asyncio.to_thread(_do_request_sync, key_entry["key"], target_model, compacted_query, gemini_tools),
+            timeout_sec=call_timeout
+        )
+        elapsed_ms = (time.monotonic() - t_start) * 1000.0
+        if res_dict:
+            await cb.record_success(elapsed_ms)
+            curr_s = await cb.health_score()
+            log_event(f"✓ FULFILLED by {acc} ({target_model}) in {elapsed_ms:.0f}ms | Score: {curr_s:.1f} | EMA: {cb.latency_ema:.0f}ms | RTK: -{saved} chars")
+            set_cached_response(p_hash, res_dict)
+            telemetry_store.emit(
+                kind=TelemetryKind.SUCCESS,
+                provider=get_provider_code(acc),
+                latency_ms=int(elapsed_ms),
+                state=StateCode.CLOSED
             )
-            elapsed_ms = (time.monotonic() - t_start) * 1000.0
-            if res_dict:
-                await cb.record_success(elapsed_ms)
-                curr_s = await cb.health_score()
-                log_event(f"✓ FULFILLED by {acc} ({target_model}) in {elapsed_ms:.0f}ms | Score: {curr_s:.1f} | EMA: {cb.latency_ema:.0f}ms | RTK: -{saved} chars")
-                set_cached_response(p_hash, res_dict)
-                telemetry_store.emit(
-                    kind=TelemetryKind.SUCCESS,
-                    provider=get_provider_code(acc),
-                    latency_ms=int(elapsed_ms),
-                    state=StateCode.CLOSED
-                )
-                return res_dict
+            return res_dict
+        else:
+            e = call_exc or Exception("Empty response from upstream")
+            err_msg = str(e).lower()
+            is_429 = "429" in err_msg or "resource_exhausted" in err_msg
+            is_5xx = "500" in err_msg or "503" in err_msg or "502" in err_msg
+            is_timeout = isinstance(e, asyncio.TimeoutError) or "timeout" in err_msg
+
+            if is_429:
+                kind = FailureKind.HTTP_429
+                err_val = 429
+            elif is_5xx:
+                kind = FailureKind.HTTP_5XX
+                err_val = 500
+            elif is_timeout:
+                kind = FailureKind.TIMEOUT
+                err_val = 408
             else:
-                e = call_exc or Exception("Empty response from upstream")
-                err_msg = str(e).lower()
-                is_429 = "429" in err_msg or "resource_exhausted" in err_msg
-                is_5xx = "500" in err_msg or "503" in err_msg or "502" in err_msg
-                is_timeout = isinstance(e, asyncio.TimeoutError) or "timeout" in err_msg
-
-                if is_429:
-                    kind = FailureKind.HTTP_429
-                    err_val = 429
-                elif is_5xx:
-                    kind = FailureKind.HTTP_5XX
-                    err_val = 500
-                elif is_timeout:
-                    kind = FailureKind.TIMEOUT
-                    err_val = 408
-                else:
-                    log_event(f"❌ Non-retryable error on {acc}: {e}")
-                    await cb.record_failure(FailureKind.TIMEOUT)
-                    telemetry_store.emit(
-                        kind=TelemetryKind.FAILURE,
-                        provider=get_provider_code(acc),
-                        state=StateCode.OPEN,
-                        value=400
-                    )
-                    break
-
-                await cb.record_failure(kind)
+                log_event(f"❌ Non-retryable error on {acc}: {e}")
+                await cb.record_failure(FailureKind.TIMEOUT)
                 telemetry_store.emit(
                     kind=TelemetryKind.FAILURE,
                     provider=get_provider_code(acc),
                     state=StateCode.OPEN,
-                    value=err_val
+                    value=400
                 )
+                break
 
-                # Decorrelated Jitter sleep before next hop (Phase 7)
-                rem_after = deadline - time.monotonic()
-                if rem_after > 2.0 and hop_count < len(ordered_pool):
-                    delay = decorrelated_jitter(previous_delay)
-                    previous_delay = delay
-                    await asyncio.sleep(min(delay, rem_after - 1.5))
-                continue
-    else:
-        log_event("🔄 All primary Gemini circuits in OPEN state (Score <= 0). Fast-falling back to Tier-4...")
+            await cb.record_failure(kind)
+            telemetry_store.emit(
+                kind=TelemetryKind.FAILURE,
+                provider=get_provider_code(acc),
+                state=StateCode.OPEN,
+                value=err_val
+            )
 
-    # Tier 4: Antigravity OAuth Failover (100% Free Uncapped Backup via CLIProxyAPI)
+            rem_after = deadline - time.monotonic()
+            if rem_after > 2.0 and hop_count < len(ordered_pool):
+                delay = decorrelated_jitter(previous_delay)
+                previous_delay = delay
+                await asyncio.sleep(min(delay, rem_after - 1.5))
+            continue
+    return None
+
+async def _handle_tier4_failover(
+    target_model: str,
+    compacted_query: str,
+    tools: Optional[List[Dict[str, Any]]],
+    deadline: float,
+    p_hash: str
+) -> Optional[Dict[str, Any]]:
     t4_cb = get_circuit("tier4_cliproxyapi")
     remaining_t4 = deadline - time.monotonic()
     if remaining_t4 > 1.5 and await t4_cb.allow_request():
         log_event(f"🛡️ Activating TIER 4 FAILOVER (CLIProxyAPI Antigravity, budget remaining: {remaining_t4:.1f}s)...")
-        gateway_heartbeat.record_activity("tier4_cliproxyapi", hop_count + 1)
+        # hop count proxy, for failover it's generally at least 1
+        gateway_heartbeat.record_activity("tier4_cliproxyapi", 1)
         telemetry_store.emit(kind=TelemetryKind.FAILOVER, provider=0, value=6)
         t4_start = time.monotonic()
         t4_timeout = min(20.0, remaining_t4)
@@ -1382,6 +1375,47 @@ async def execute_model_request(model: str, messages: List[Dict[str, Any]], tool
                 value=429 if "429" in err_msg else 408
             )
             log_event(f"❌ Tier 4 Failover error: {e_failover}")
+    return None
+
+async def execute_model_request(model: str, messages: List[Dict[str, Any]], tools: Optional[List[Dict[str, Any]]] = None) -> Dict[str, Any]:
+    STATS["total_requests"] += 1
+
+    full_query = _parse_messages_to_prompt(messages)
+    compacted_query, saved = rtk_compact_text(full_query)
+    telemetry_store.emit(kind=TelemetryKind.REQUEST, provider=0)
+
+    p_hash = hashlib.md5((compacted_query + "_" + str(tools)).encode("utf-8")).hexdigest()
+    cached = get_cached_response(p_hash)
+    if cached:
+        log_event(f"⚡ Cache Hit! Instant return (0ms latency, 0 quota used).")
+        return cached
+
+    special_res = await _handle_special_models(model, compacted_query, tools, p_hash)
+    if special_res:
+        return special_res
+
+    keys_pool = _load_gemini_keys_pool()
+    if not keys_pool:
+        return {"text": "[LAR-OS Gateway Error] No active Google API keys found.", "tool_calls": []}
+
+    target_model = "gemini-3.5-flash-lite" if ("flash" in model or "2.5" in model or "claude" in model) else model
+    ordered_pool = await _score_and_sort_keys(keys_pool)
+    gemini_tools = translate_anthropic_tools_to_gemini(tools) if tools else None
+
+    deadline = time.monotonic() + REQUEST_BUDGET_SEC
+
+    if ordered_pool:
+        primary_res = await _execute_primary_routing_loop(
+            ordered_pool, target_model, compacted_query, gemini_tools, deadline, saved, p_hash
+        )
+        if primary_res:
+            return primary_res
+    else:
+        log_event("🔄 All primary Gemini circuits in OPEN state (Score <= 0). Fast-falling back to Tier-4...")
+
+    failover_res = await _handle_tier4_failover(target_model, compacted_query, tools, deadline, p_hash)
+    if failover_res:
+        return failover_res
 
     return {"text": "[LAR-OS Gateway Failover] All active accounts and failover circuits are currently cooling down. Retry shortly.", "tool_calls": []}
 
