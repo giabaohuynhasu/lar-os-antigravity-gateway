@@ -22,6 +22,7 @@ import asyncio
 import socket
 import urllib.request
 import urllib.error
+import aiohttp
 import enum
 import random
 import contextlib
@@ -638,6 +639,7 @@ class Tier4DeepHealth:
         self.oauth_usable: Optional[bool] = None
         self.last_probe_time: float = 0.0
         self._lock = asyncio.Lock()
+        self._session: Optional[aiohttp.ClientSession] = None
 
     def record_result(self, status_code: int) -> None:
         if 200 <= status_code < 300:
@@ -655,29 +657,29 @@ class Tier4DeepHealth:
                 return self.oauth_usable
             self.last_probe_time = now
 
-            def _do_probe():
-                req = urllib.request.Request(
-                    self.check_url,
-                    headers={"Authorization": f"Bearer {CLIPROXY_KEY}"},
-                    method="GET"
-                )
-                try:
-                    with urllib.request.urlopen(req, timeout=2.5) as r:
-                        return r.status == 200
-                except urllib.error.HTTPError as he:
-                    if he.code in (401, 403):
-                        return False
-                    return False
-                except Exception:
-                    return False
+            if self._session is None:
+                self._session = aiohttp.ClientSession()
 
             try:
-                is_ok = await asyncio.to_thread(_do_probe)
+                async with self._session.get(
+                    self.check_url,
+                    headers={"Authorization": f"Bearer {CLIPROXY_KEY}"},
+                    timeout=aiohttp.ClientTimeout(total=2.5)
+                ) as r:
+                    is_ok = (r.status == 200)
+            except Exception:
+                is_ok = False
+
+            try:
                 if is_ok:
                     self.oauth_usable = True
                 return self.oauth_usable
             except Exception:
                 return self.oauth_usable
+
+    async def close(self) -> None:
+        if self._session is not None:
+            await self._session.close()
 
     def snapshot(self) -> dict:
         return {
@@ -1004,6 +1006,7 @@ async def on_shutdown():
     await gateway_heartbeat.stop()
     await cli_watchdog.stop()
     telemetry_store.stop()
+    await tier4_deep_health.close()
     log_event("🛑 LAR-OS Gateway shutdown. Heartbeat sentinel recorded, CLIProxyWatchdog & SQLite Telemetry cleanly stopped.")
 
 MODELS_REGISTRY = [
