@@ -1,4 +1,5 @@
 import asyncio
+import aiohttp
 import json
 import os
 import shutil
@@ -41,15 +42,17 @@ Nhờ bạn tổng kết ngắn gọn cập nhật trạng thái mới nhất c�
 
 async def main():
     print("[1] Activating Opera Neon tab...")
-    try:
-        req = urllib.request.Request(f"http://127.0.0.1:9224/json/activate/{TARGET_ID}")
-        with urllib.request.urlopen(req) as resp:
-            print("  -> Tab activation:", resp.read().decode())
-    except Exception as e:
-        print("  -> Activate error:", e)
+    async with aiohttp.ClientSession() as session:
+        try:
+            async with session.get(f"http://127.0.0.1:9224/json/activate/{TARGET_ID}") as resp:
+                text = await resp.text()
+                print("  -> Tab activation:", text)
+        except Exception as e:
+            print("  -> Activate error:", e)
 
-    with urllib.request.urlopen("http://127.0.0.1:9224/json") as r:
-        tabs = json.loads(r.read().decode("utf-8"))
+        async with session.get("http://127.0.0.1:9224/json") as r:
+            tabs = await r.json()
+
     t = [x for x in tabs if x.get("id") == TARGET_ID]
     if not t:
         print("[-] Target tab not found!")
