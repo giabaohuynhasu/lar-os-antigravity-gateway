@@ -1,12 +1,12 @@
 {
   "header": {
     "algorithm": "HMAC-SHA256",
-    "signature": "b7df964dc6d294a2279c57a8cc19129ac94217cdf92ad4f31c85844acd76cfc3",
-    "created_at": "2026-09-04T03:16:02.517907+00:00"
+    "signature": "b84d4aa40de4ae028e08234c6d97bcdfa223c138b19aa34572a713ecdee70c99",
+    "created_at": "2026-09-29T01:41:42.507186+00:00"
   },
   "payload": {
     "protocol_version": "AHCP-V1.0",
-    "timestamp": "2026-09-04T03:16:02.517907+00:00",
+    "timestamp": "2026-09-29T01:41:42.507186+00:00",
     "source_instance": "TEST-INSTANCE-01",
     "reason": "Unit test execution",
     "system_status": {
@@ -15,7 +15,7 @@
       "gateway_status": "ACTIVE_DAEMON",
       "default_ai_studio_model": "gemini-3.6-flash",
       "total_unit_tests_passing": 27,
-      "working_directory": "C:\\Users\\nswcl\\.gemini\\antigravity-ide\\scratch\\lar-os-antigravity-gateway"
+      "working_directory": "/app"
     },
     "author_metadata": {
       "name": "Gia Bao Huynh",
