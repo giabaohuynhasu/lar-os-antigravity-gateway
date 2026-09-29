@@ -887,30 +887,12 @@ cli_watchdog = CLIProxyWatchdog(executable=CLIPROXY_EXE, config=CLIPROXY_CONFIG)
 HEARTBEAT_PATH = CURRENT_DIR / "heartbeat.json"
 
 def get_windows_process_creation_time(pid: int) -> float:
-    """Gets process creation time using Windows GetProcessTimes API or time.time() fallback."""
-    if pid <= 0:
+    """Get precise Windows process creation time to detect PID reuse."""
+    import psutil
+    try:
+        return psutil.Process(pid).create_time()
+    except psutil.NoSuchProcess:
         return 0.0
-    if sys.platform.startswith("win"):
-        try:
-            import ctypes
-            from ctypes import wintypes
-            PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
-            handle = ctypes.windll.kernel32.OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, False, pid)
-            if handle:
-                try:
-                    class FILETIME(ctypes.Structure):
-                        _fields_ = [("dwLowDateTime", wintypes.DWORD), ("dwHighDateTime", wintypes.DWORD)]
-                    ct, et, kt, ut = FILETIME(), FILETIME(), FILETIME(), FILETIME()
-                    if ctypes.windll.kernel32.GetProcessTimes(
-                        handle, ctypes.byref(ct), ctypes.byref(et), ctypes.byref(kt), ctypes.byref(ut)
-                    ):
-                        ft_val = (ct.dwHighDateTime << 32) + ct.dwLowDateTime
-                        return (ft_val - 116444736000000000) / 10000000.0
-                finally:
-                    ctypes.windll.kernel32.CloseHandle(handle)
-        except Exception:
-            pass
-    return time.time()
 
 class GatewayHeartbeatEmitter:
     """
