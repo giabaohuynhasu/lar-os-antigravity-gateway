@@ -13,6 +13,7 @@ import json
 import time
 import asyncio
 import urllib.request
+import aiohttp
 from pathlib import Path
 from typing import Dict, Any, Optional
 
@@ -50,17 +51,16 @@ class GeminiSparkDaemon:
             "temperature": 0.3
         }
         
-        req_data = json.dumps(payload).encode("utf-8")
-        req = urllib.request.Request(
-            GATEWAY_API_URL,
-            data=req_data,
-            headers={"Content-Type": "application/json", "Authorization": "Bearer lar-os-spark-key"}
-        )
-        
         try:
-            with urllib.request.urlopen(req, timeout=45) as resp:
-                data = json.loads(resp.read().decode("utf-8"))
-                return data["choices"][0]["message"]["content"]
+            async with aiohttp.ClientSession() as session:
+                async with session.post(
+                    GATEWAY_API_URL,
+                    json=payload,
+                    headers={"Content-Type": "application/json", "Authorization": "Bearer lar-os-spark-key"},
+                    timeout=aiohttp.ClientTimeout(total=45)
+                ) as resp:
+                    data = await resp.json()
+                    return data["choices"][0]["message"]["content"]
         except Exception as e:
             return f"[Error contacting LAR-OS Gateway: {e}. Output generated locally.]"
 
