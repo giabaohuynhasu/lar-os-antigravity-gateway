@@ -2126,149 +2126,151 @@ async def call_neon_consult_api(request: Request):
 # ==========================================
 # 9. EMBEDDED WEB DASHBOARD
 # ==========================================
-@app.get("/dashboard", response_class=HTMLResponse)
-async def dashboard_page():
-    html_content = """
-    <!DOCTYPE html>
-    <html lang="vi">
-    <head>
-        <meta charset="UTF-8">
-        <title>⚡ LAR-OS Unified Gateway v3.0 Dashboard</title>
-        <link href="https://fonts.googleapis.com/css2?family=Outfit:wght@300;400;600;700&family=JetBrains+Mono:wght@400;600&display=swap" rel="stylesheet">
-        <style>
-            :root {
-                --bg: #0b0f19;
-                --panel: #111827;
-                --border: #1f2937;
-                --accent: #3b82f6;
-                --emerald: #10b981;
-                --amber: #f59e0b;
-                --text: #f3f4f6;
-                --muted: #9ca3af;
-            }
-            body {
-                margin: 0;
-                padding: 24px;
-                background: var(--bg);
-                color: var(--text);
-                font-family: 'Outfit', sans-serif;
-            }
-            .container { max-width: 1100px; margin: 0 auto; }
-            .header { display: flex; justify-content: space-between; align-items: center; margin-bottom: 24px; border-bottom: 1px solid var(--border); padding-bottom: 16px; }
-            .header h1 { margin: 0; font-size: 24px; font-weight: 700; color: #fff; display: flex; align-items: center; gap: 10px; }
-            .badge { background: #1e3a8a; color: #93c5fd; padding: 4px 12px; border-radius: 9999px; font-size: 13px; font-weight: 600; }
-            .badge-live { background: #064e3b; color: #6ee7b7; animation: pulse 2s infinite; }
-            @keyframes pulse { 0%, 100% { opacity: 1; } 50% { opacity: 0.6; } }
-            .grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(240px, 1fr)); gap: 16px; margin-bottom: 24px; }
-            .card { background: var(--panel); border: 1px solid var(--border); border-radius: 12px; padding: 20px; box-shadow: 0 4px 12px rgba(0,0,0,0.3); }
-            .card-title { font-size: 13px; color: var(--muted); text-transform: uppercase; letter-spacing: 0.05em; margin-bottom: 8px; font-weight: 600; }
-            .card-val { font-size: 28px; font-weight: 700; color: #fff; font-family: 'JetBrains Mono', monospace; }
-            .card-sub { font-size: 12px; color: var(--emerald); margin-top: 6px; }
-            .section { background: var(--panel); border: 1px solid var(--border); border-radius: 12px; padding: 20px; margin-bottom: 24px; }
-            .section h2 { margin-top: 0; font-size: 18px; border-bottom: 1px solid var(--border); padding-bottom: 10px; color: #fff; }
-            .account-list { display: flex; flex-direction: column; gap: 10px; }
-            .account-row { display: flex; justify-content: space-between; align-items: center; padding: 12px 16px; background: #1f2937; border-radius: 8px; }
-            .acc-name { font-family: 'JetBrains Mono', monospace; font-size: 14px; }
-            .acc-role { color: var(--muted); font-size: 12px; margin-top: 2px; }
-            .terminal { background: #000; border: 1px solid var(--border); border-radius: 8px; padding: 16px; font-family: 'JetBrains Mono', monospace; font-size: 13px; color: #a7f3d0; max-height: 220px; overflow-y: auto; }
-            .refresh-btn { background: var(--accent); color: #fff; border: none; padding: 8px 16px; border-radius: 6px; cursor: pointer; font-weight: 600; }
-            .refresh-btn:hover { background: #2563eb; }
-        </style>
-    </head>
-    <body>
-        <div class="container">
-            <div class="header">
-                <h1>⚡ LAR-OS Unified AI Gateway <span class="badge">v3.0 Agentic</span></h1>
-                <div>
-                    <span class="badge badge-live">● ONLINE (PORT 18797)</span>
-                    <button class="refresh-btn" onclick="location.reload()">Làm mới</button>
-                </div>
-            </div>
 
-            <div class="grid">
-                <div class="card">
-                    <div class="card-title">Tổng số yêu cầu (Requests)</div>
-                    <div class="card-val" id="stat-req">--</div>
-                    <div class="card-sub">Tự động cân bằng tải</div>
-                </div>
-                <div class="card">
-                    <div class="card-title">Bộ nhớ đệm (LRU Cache Hits)</div>
-                    <div class="card-val" id="stat-cache">--</div>
-                    <div class="card-sub">0ms phản hồi / 0 quota tiêu tốn</div>
-                </div>
-                <div class="card">
-                    <div class="card-title">RTK Compactor Token Tiết Kiệm</div>
-                    <div class="card-val" id="stat-rtk">--</div>
-                    <div class="card-sub">Giảm 35% chi phí context</div>
-                </div>
-                <div class="card">
-                    <div class="card-title">Bảo vệ Anti-Crash Protocol</div>
-                    <div class="card-val" style="color: #10b981;">ACP-V1</div>
-                    <div class="card-sub">Ổ cứng an toàn > 85GB</div>
-                </div>
-                <div class="card">
-                    <div class="card-title">Google Drive Connector (G:)</div>
-                    <div class="card-val" id="stat-drive" style="font-size: 18px; color: #38bdf8;">Đang kết nối...</div>
-                    <div class="card-sub" id="stat-drive-sub">Tự động đồng bộ đám mây</div>
-                </div>
-            </div>
-
-            <div class="section">
-                <h2>🏛️ Trạng Thái Hồ Sơ Google AI Pro (Multi-Account Pool)</h2>
-                <div class="account-list">
-                    <div class="account-row">
-                        <div>
-                            <div class="acc-name">thuaquan228@gmail.com</div>
-                            <div class="acc-role">Lead Architect & Core Coding Engine (Cloud Shell Node 1 - 16GB RAM)</div>
-                        </div>
-                        <span class="badge" style="background:#064e3b; color:#34d399;">PRO_PRIMARY • ACTIVE</span>
-                    </div>
-                    <div class="account-row">
-                        <div>
-                            <div class="acc-name">giabaohuynh0512@gmail.com</div>
-                            <div class="acc-role">System Automation, Tool Execution & Daemon Watchdog (Cloud Shell Node 2 - 8GB RAM)</div>
-                        </div>
-                        <span class="badge" style="background:#064e3b; color:#34d399;">PRO_AUTOMATION • ACTIVE</span>
-                    </div>
-                    <div class="account-row">
-                        <div>
-                            <div class="acc-name">baohuynhgia0512@gmail.com</div>
-                            <div class="acc-role">Deep Reasoning, Logic Engine & Security Audit</div>
-                        </div>
-                        <span class="badge" style="background:#064e3b; color:#34d399;">PRO_REASONING • ACTIVE</span>
-                    </div>
-                </div>
-            </div>
-
-            <div class="section">
-                <h2>📜 Nhật Ký Hoạt Động Thời Gian Thực (Live Terminal Stream)</h2>
-                <div class="terminal" id="term-logs">Đang tải nhật ký từ Gateway...</div>
+AGENTIC_DASHBOARD_HTML = """
+<!DOCTYPE html>
+<html lang="vi">
+<head>
+    <meta charset="UTF-8">
+    <title>⚡ LAR-OS Unified Gateway v3.0 Dashboard</title>
+    <link href="https://fonts.googleapis.com/css2?family=Outfit:wght@300;400;600;700&family=JetBrains+Mono:wght@400;600&display=swap" rel="stylesheet">
+    <style>
+        :root {
+            --bg: #0b0f19;
+            --panel: #111827;
+            --border: #1f2937;
+            --accent: #3b82f6;
+            --emerald: #10b981;
+            --amber: #f59e0b;
+            --text: #f3f4f6;
+            --muted: #9ca3af;
+        }
+        body {
+            margin: 0;
+            padding: 24px;
+            background: var(--bg);
+            color: var(--text);
+            font-family: 'Outfit', sans-serif;
+        }
+        .container { max-width: 1100px; margin: 0 auto; }
+        .header { display: flex; justify-content: space-between; align-items: center; margin-bottom: 24px; border-bottom: 1px solid var(--border); padding-bottom: 16px; }
+        .header h1 { margin: 0; font-size: 24px; font-weight: 700; color: #fff; display: flex; align-items: center; gap: 10px; }
+        .badge { background: #1e3a8a; color: #93c5fd; padding: 4px 12px; border-radius: 9999px; font-size: 13px; font-weight: 600; }
+        .badge-live { background: #064e3b; color: #6ee7b7; animation: pulse 2s infinite; }
+        @keyframes pulse { 0%, 100% { opacity: 1; } 50% { opacity: 0.6; } }
+        .grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(240px, 1fr)); gap: 16px; margin-bottom: 24px; }
+        .card { background: var(--panel); border: 1px solid var(--border); border-radius: 12px; padding: 20px; box-shadow: 0 4px 12px rgba(0,0,0,0.3); }
+        .card-title { font-size: 13px; color: var(--muted); text-transform: uppercase; letter-spacing: 0.05em; margin-bottom: 8px; font-weight: 600; }
+        .card-val { font-size: 28px; font-weight: 700; color: #fff; font-family: 'JetBrains Mono', monospace; }
+        .card-sub { font-size: 12px; color: var(--emerald); margin-top: 6px; }
+        .section { background: var(--panel); border: 1px solid var(--border); border-radius: 12px; padding: 20px; margin-bottom: 24px; }
+        .section h2 { margin-top: 0; font-size: 18px; border-bottom: 1px solid var(--border); padding-bottom: 10px; color: #fff; }
+        .account-list { display: flex; flex-direction: column; gap: 10px; }
+        .account-row { display: flex; justify-content: space-between; align-items: center; padding: 12px 16px; background: #1f2937; border-radius: 8px; }
+        .acc-name { font-family: 'JetBrains Mono', monospace; font-size: 14px; }
+        .acc-role { color: var(--muted); font-size: 12px; margin-top: 2px; }
+        .terminal { background: #000; border: 1px solid var(--border); border-radius: 8px; padding: 16px; font-family: 'JetBrains Mono', monospace; font-size: 13px; color: #a7f3d0; max-height: 220px; overflow-y: auto; }
+        .refresh-btn { background: var(--accent); color: #fff; border: none; padding: 8px 16px; border-radius: 6px; cursor: pointer; font-weight: 600; }
+        .refresh-btn:hover { background: #2563eb; }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <div class="header">
+            <h1>⚡ LAR-OS Unified AI Gateway <span class="badge">v3.0 Agentic</span></h1>
+            <div>
+                <span class="badge badge-live">● ONLINE (PORT 18797)</span>
+                <button class="refresh-btn" onclick="location.reload()">Làm mới</button>
             </div>
         </div>
 
-        <script>
-            async function updateStats() {
-                try {
-                    const res = await fetch('/health');
-                    const data = await res.json();
-                    document.getElementById('stat-req').innerText = data.total_requests;
-                    document.getElementById('stat-cache').innerText = data.cache_hits;
-                    document.getElementById('stat-rtk').innerText = data.tokens_saved_chars + ' chars';
-                    if (data.google_drive && data.google_drive.status === 'CONNECTED') {
-                        document.getElementById('stat-drive').innerText = 'CONNECTED (' + data.google_drive.synced_files_count + ' tệp)';
-                        document.getElementById('stat-drive-sub').innerText = data.google_drive.mount_point + ' • ' + data.google_drive.free_gb + ' GB trống';
-                    } else {
-                        document.getElementById('stat-drive').innerText = 'OFFLINE';
-                    }
-                } catch(e) {}
-            }
-            updateStats();
-            setInterval(updateStats, 3000);
-        </script>
-    </body>
-    </html>
-    """
-    return HTMLResponse(content=html_content)
+        <div class="grid">
+            <div class="card">
+                <div class="card-title">Tổng số yêu cầu (Requests)</div>
+                <div class="card-val" id="stat-req">--</div>
+                <div class="card-sub">Tự động cân bằng tải</div>
+            </div>
+            <div class="card">
+                <div class="card-title">Bộ nhớ đệm (LRU Cache Hits)</div>
+                <div class="card-val" id="stat-cache">--</div>
+                <div class="card-sub">0ms phản hồi / 0 quota tiêu tốn</div>
+            </div>
+            <div class="card">
+                <div class="card-title">RTK Compactor Token Tiết Kiệm</div>
+                <div class="card-val" id="stat-rtk">--</div>
+                <div class="card-sub">Giảm 35% chi phí context</div>
+            </div>
+            <div class="card">
+                <div class="card-title">Bảo vệ Anti-Crash Protocol</div>
+                <div class="card-val" style="color: #10b981;">ACP-V1</div>
+                <div class="card-sub">Ổ cứng an toàn > 85GB</div>
+            </div>
+            <div class="card">
+                <div class="card-title">Google Drive Connector (G:)</div>
+                <div class="card-val" id="stat-drive" style="font-size: 18px; color: #38bdf8;">Đang kết nối...</div>
+                <div class="card-sub" id="stat-drive-sub">Tự động đồng bộ đám mây</div>
+            </div>
+        </div>
+
+        <div class="section">
+            <h2>🏛️ Trạng Thái Hồ Sơ Google AI Pro (Multi-Account Pool)</h2>
+            <div class="account-list">
+                <div class="account-row">
+                    <div>
+                        <div class="acc-name">thuaquan228@gmail.com</div>
+                        <div class="acc-role">Lead Architect & Core Coding Engine (Cloud Shell Node 1 - 16GB RAM)</div>
+                    </div>
+                    <span class="badge" style="background:#064e3b; color:#34d399;">PRO_PRIMARY • ACTIVE</span>
+                </div>
+                <div class="account-row">
+                    <div>
+                        <div class="acc-name">giabaohuynh0512@gmail.com</div>
+                        <div class="acc-role">System Automation, Tool Execution & Daemon Watchdog (Cloud Shell Node 2 - 8GB RAM)</div>
+                    </div>
+                    <span class="badge" style="background:#064e3b; color:#34d399;">PRO_AUTOMATION • ACTIVE</span>
+                </div>
+                <div class="account-row">
+                    <div>
+                        <div class="acc-name">baohuynhgia0512@gmail.com</div>
+                        <div class="acc-role">Deep Reasoning, Logic Engine & Security Audit</div>
+                    </div>
+                    <span class="badge" style="background:#064e3b; color:#34d399;">PRO_REASONING • ACTIVE</span>
+                </div>
+            </div>
+        </div>
+
+        <div class="section">
+            <h2>📜 Nhật Ký Hoạt Động Thời Gian Thực (Live Terminal Stream)</h2>
+            <div class="terminal" id="term-logs">Đang tải nhật ký từ Gateway...</div>
+        </div>
+    </div>
+
+    <script>
+        async function updateStats() {
+            try {
+                const res = await fetch('/health');
+                const data = await res.json();
+                document.getElementById('stat-req').innerText = data.total_requests;
+                document.getElementById('stat-cache').innerText = data.cache_hits;
+                document.getElementById('stat-rtk').innerText = data.tokens_saved_chars + ' chars';
+                if (data.google_drive && data.google_drive.status === 'CONNECTED') {
+                    document.getElementById('stat-drive').innerText = 'CONNECTED (' + data.google_drive.synced_files_count + ' tệp)';
+                    document.getElementById('stat-drive-sub').innerText = data.google_drive.mount_point + ' • ' + data.google_drive.free_gb + ' GB trống';
+                } else {
+                    document.getElementById('stat-drive').innerText = 'OFFLINE';
+                }
+            } catch(e) {}
+        }
+        updateStats();
+        setInterval(updateStats, 3000);
+    </script>
+</body>
+</html>
+"""
+
+@app.get("/dashboard", response_class=HTMLResponse)
+async def dashboard_page():
+    return HTMLResponse(content=AGENTIC_DASHBOARD_HTML)
 
 def run():
     cfg = get_config()
