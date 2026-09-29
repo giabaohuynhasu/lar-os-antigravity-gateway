@@ -39,197 +39,212 @@ Nhờ bạn cùng brainstorm các giải pháp công nghệ để phòng bệnh 
 3. TỔNG KẾT NGỮ CẢNH HỆ THỐNG (CONTEXT SUMMARY):
 Nhờ bạn tổng kết ngắn gọn cập nhật trạng thái mới nhất của hệ thống (Antigravity IDE Recovered + Phase 12.1 Nuclear Hardening 100% + Golden Invariants) để mình lưu ngay vào Obsidian Vault cho user theo dõi."""
 
-async def main():
+def activate_tab(target_id: str):
     print("[1] Activating Opera Neon tab...")
     try:
-        req = urllib.request.Request(f"http://127.0.0.1:9224/json/activate/{TARGET_ID}")
+        req = urllib.request.Request(f"http://127.0.0.1:9224/json/activate/{target_id}")
         with urllib.request.urlopen(req) as resp:
             print("  -> Tab activation:", resp.read().decode())
     except Exception as e:
         print("  -> Activate error:", e)
 
+def get_ws_url(target_id: str) -> str:
     with urllib.request.urlopen("http://127.0.0.1:9224/json") as r:
         tabs = json.loads(r.read().decode("utf-8"))
-    t = [x for x in tabs if x.get("id") == TARGET_ID]
+    t = [x for x in tabs if x.get("id") == target_id]
     if not t:
         print("[-] Target tab not found!")
-        return
-    ws_url = t[0].get("webSocketDebuggerUrl")
+        return ""
+    return t[0].get("webSocketDebuggerUrl", "")
+
+async def get_baseline_turns(ws) -> int:
+    # Record baseline assistant turns
+    count_js = """
+    (function() {
+        var turns = document.querySelectorAll('div[data-message-author-role="assistant"], article');
+        return turns.length;
+    })()
+    """
+    await ws.send(json.dumps({"id": 2, "method": "Runtime.evaluate", "params": {"expression": count_js, "returnByValue": True}}))
+    baseline_count = 0
+    while True:
+        raw = await asyncio.wait_for(ws.recv(), 5.0)
+        msg = json.loads(raw)
+        if msg.get("id") == 2:
+            baseline_count = msg.get("result", {}).get("result", {}).get("value") or 0
+            print(f"  -> Baseline assistant turns: {baseline_count}")
+            break
+    return baseline_count
+
+async def inject_prompt(ws, prompt: str):
+    # Inject prompt into the bottom-most composer strictly
+    escaped_prompt = json.dumps(prompt)
+    inject_js = f"""
+    (async function() {{
+        // 1. Smooth scroll to the bottom of the page
+        window.scrollTo({{ top: document.body.scrollHeight, behavior: 'smooth' }});
+        await new Promise(r => setTimeout(r, 500));
+
+        // 2. Select bottom canonical chat composer
+        var composer = document.querySelector('form #prompt-textarea') || document.querySelector('#prompt-textarea');
+        if (!composer) return JSON.stringify({{ ok: false, error: "Composer not found" }});
+
+        composer.scrollIntoView({{ behavior: 'smooth', block: 'end' }});
+        composer.focus();
+
+        // Clear any draft
+        document.execCommand('selectAll', false, null);
+        document.execCommand('delete', false, null);
+
+        // Insert prompt via execCommand to trigger React / ProseMirror state
+        document.execCommand('insertText', false, {escaped_prompt});
+
+        // Fallback input dispatch
+        composer.dispatchEvent(new Event('input', {{ bubbles: true }}));
+        composer.dispatchEvent(new Event('change', {{ bubbles: true }}));
+
+        await new Promise(r => setTimeout(r, 400));
+
+        // 3. Find send button and click
+        var form = composer.closest('form') || composer.parentElement;
+        var sendBtn = form.querySelector('button[data-testid="send-button"]') ||
+                      form.querySelector('button.composer-submit-btn') ||
+                      form.querySelector('button.composer-submit-button-color');
+
+        if (sendBtn && !sendBtn.disabled && sendBtn.getAttribute('aria-disabled') !== 'true') {{
+            sendBtn.click();
+            return JSON.stringify({{ ok: true, method: "button_click" }});
+        }}
+
+        // Fallback: Dispatch Enter keydown
+        var enterEvt = new KeyboardEvent('keydown', {{
+            key: 'Enter',
+            code: 'Enter',
+            keyCode: 13,
+            which: 13,
+            bubbles: true,
+            cancelable: true
+        }});
+        composer.dispatchEvent(enterEvt);
+        return JSON.stringify({{ ok: true, method: "enter_fallback" }});
+    }})()
+    """
+
+    print("[3] Injecting prompt into bottom composer with smooth scroll...")
+    await ws.send(json.dumps({
+        "id": 3,
+        "method": "Runtime.evaluate",
+        "params": {"expression": inject_js, "returnByValue": True, "awaitPromise": True}
+    }))
+
+    while True:
+        raw = await asyncio.wait_for(ws.recv(), 10.0)
+        msg = json.loads(raw)
+        if msg.get("id") == 3:
+            res_val = msg.get("result", {}).get("result", {}).get("value")
+            print(f"  -> Injection status: {res_val}")
+            break
+
+async def monitor_response(ws, baseline_count: int) -> str:
+    print("[4] Monitoring ChatGPT response stream...")
+    start_time = time.time()
+    last_text = ""
+    stable_count = 0
+    has_streamed = False
+
+    while time.time() - start_time < 180:
+        await asyncio.sleep(2.5)
+        # Re-activate tab and bring to front so stream is never throttled
+        await ws.send(json.dumps({"id": 10, "method": "Page.bringToFront"}))
+
+        scrape_js = """
+        (function() {
+            var stopBtn = document.querySelector('button[data-testid="stop-button"], [aria-label*="Dừng"], [aria-label*="Stop"]');
+            var turns = Array.from(document.querySelectorAll('div[data-message-author-role="assistant"], article'));
+            var lastTurn = turns.length > 0 ? turns[turns.length - 1] : null;
+            var text = "";
+            if (lastTurn) {
+                var md = lastTurn.querySelector('.markdown') || lastTurn;
+                text = md.innerText.trim();
+            }
+            return JSON.stringify({
+                is_streaming: Boolean(stopBtn),
+                turns_count: turns.length,
+                text: text
+            });
+        })()
+        """
+        scrape_id = int(time.time() * 1000) % 100000
+        await ws.send(json.dumps({
+            "id": scrape_id,
+            "method": "Runtime.evaluate",
+            "params": {"expression": scrape_js, "returnByValue": True}
+        }))
+
+        data = None
+        try:
+            while True:
+                raw = await asyncio.wait_for(ws.recv(), 4.0)
+                m = json.loads(raw)
+                if m.get("id") == scrape_id:
+                    val = m.get("result", {}).get("result", {}).get("value")
+                    if val:
+                        data = json.loads(val)
+                    break
+        except asyncio.TimeoutError:
+            continue
+
+        if not data:
+            continue
+
+        curr = data.get("text", "")
+        streaming = data.get("is_streaming", False)
+        turns_count = data.get("turns_count", 0)
+
+        if streaming:
+            has_streamed = True
+            print(f"  ... Streaming response ({len(curr)} chars) ...")
+
+        if (turns_count > baseline_count or has_streamed) and curr:
+            if curr == last_text and not streaming:
+                stable_count += 1
+                if stable_count >= 2:
+                    print(f"[✓] ChatGPT Response Completed ({len(curr)} chars) in {round(time.time() - start_time, 1)}s!")
+                    with open("chatgpt_hospital_response.md", "w", encoding="utf-8") as f:
+                        f.write(curr)
+                    print("  -> Saved response to chatgpt_hospital_response.md")
+
+                    # Now update Obsidian Vault session summary
+                    update_session_summary(curr)
+                    return curr
+            else:
+                stable_count = 0
+                last_text = curr
+
+    if last_text:
+        print(f"[!] Reached timeout, capturing partial response ({len(last_text)} chars)")
+        with open("chatgpt_hospital_response.md", "w", encoding="utf-8") as f:
+            f.write(last_text)
+        update_session_summary(last_text)
+        return last_text
+
+    print("[-] Timeout waiting for response")
+    return ""
+
+async def main():
+    activate_tab(TARGET_ID)
+    ws_url = get_ws_url(TARGET_ID)
+    if not ws_url:
+        return ""
 
     async with websockets.connect(ws_url, max_size=25*1024*1024) as ws:
         print("[2] Connected to WebSocket debugger. Bringing page to front...")
         await ws.send(json.dumps({"id": 1, "method": "Page.bringToFront"}))
         await asyncio.sleep(0.5)
 
-        # Record baseline assistant turns
-        count_js = """
-        (function() {
-            var turns = document.querySelectorAll('div[data-message-author-role="assistant"], article');
-            return turns.length;
-        })()
-        """
-        await ws.send(json.dumps({"id": 2, "method": "Runtime.evaluate", "params": {"expression": count_js, "returnByValue": True}}))
-        baseline_count = 0
-        while True:
-            raw = await asyncio.wait_for(ws.recv(), 5.0)
-            msg = json.loads(raw)
-            if msg.get("id") == 2:
-                baseline_count = msg.get("result", {}).get("result", {}).get("value") or 0
-                print(f"  -> Baseline assistant turns: {baseline_count}")
-                break
-
-        # Inject prompt into the bottom-most composer strictly
-        escaped_prompt = json.dumps(PROMPT)
-        inject_js = f"""
-        (async function() {{
-            // 1. Smooth scroll to the bottom of the page
-            window.scrollTo({{ top: document.body.scrollHeight, behavior: 'smooth' }});
-            await new Promise(r => setTimeout(r, 500));
-
-            // 2. Select bottom canonical chat composer
-            var composer = document.querySelector('form #prompt-textarea') || document.querySelector('#prompt-textarea');
-            if (!composer) return JSON.stringify({{ ok: false, error: "Composer not found" }});
-
-            composer.scrollIntoView({{ behavior: 'smooth', block: 'end' }});
-            composer.focus();
-
-            // Clear any draft
-            document.execCommand('selectAll', false, null);
-            document.execCommand('delete', false, null);
-
-            // Insert prompt via execCommand to trigger React / ProseMirror state
-            document.execCommand('insertText', false, {escaped_prompt});
-
-            // Fallback input dispatch
-            composer.dispatchEvent(new Event('input', {{ bubbles: true }}));
-            composer.dispatchEvent(new Event('change', {{ bubbles: true }}));
-
-            await new Promise(r => setTimeout(r, 400));
-
-            // 3. Find send button and click
-            var form = composer.closest('form') || composer.parentElement;
-            var sendBtn = form.querySelector('button[data-testid="send-button"]') ||
-                          form.querySelector('button.composer-submit-btn') ||
-                          form.querySelector('button.composer-submit-button-color');
-
-            if (sendBtn && !sendBtn.disabled && sendBtn.getAttribute('aria-disabled') !== 'true') {{
-                sendBtn.click();
-                return JSON.stringify({{ ok: true, method: "button_click" }});
-            }}
-
-            // Fallback: Dispatch Enter keydown
-            var enterEvt = new KeyboardEvent('keydown', {{
-                key: 'Enter',
-                code: 'Enter',
-                keyCode: 13,
-                which: 13,
-                bubbles: true,
-                cancelable: true
-            }});
-            composer.dispatchEvent(enterEvt);
-            return JSON.stringify({{ ok: true, method: "enter_fallback" }});
-        }})()
-        """
-
-        print("[3] Injecting prompt into bottom composer with smooth scroll...")
-        await ws.send(json.dumps({
-            "id": 3,
-            "method": "Runtime.evaluate",
-            "params": {"expression": inject_js, "returnByValue": True, "awaitPromise": True}
-        }))
-
-        while True:
-            raw = await asyncio.wait_for(ws.recv(), 10.0)
-            msg = json.loads(raw)
-            if msg.get("id") == 3:
-                res_val = msg.get("result", {}).get("result", {}).get("value")
-                print(f"  -> Injection status: {res_val}")
-                break
-
-        print("[4] Monitoring ChatGPT response stream...")
-        start_time = time.time()
-        last_text = ""
-        stable_count = 0
-        has_streamed = False
-
-        while time.time() - start_time < 180:
-            await asyncio.sleep(2.5)
-            # Re-activate tab and bring to front so stream is never throttled
-            await ws.send(json.dumps({"id": 10, "method": "Page.bringToFront"}))
-
-            scrape_js = """
-            (function() {
-                var stopBtn = document.querySelector('button[data-testid="stop-button"], [aria-label*="Dừng"], [aria-label*="Stop"]');
-                var turns = Array.from(document.querySelectorAll('div[data-message-author-role="assistant"], article'));
-                var lastTurn = turns.length > 0 ? turns[turns.length - 1] : null;
-                var text = "";
-                if (lastTurn) {
-                    var md = lastTurn.querySelector('.markdown') || lastTurn;
-                    text = md.innerText.trim();
-                }
-                return JSON.stringify({
-                    is_streaming: Boolean(stopBtn),
-                    turns_count: turns.length,
-                    text: text
-                });
-            })()
-            """
-            scrape_id = int(time.time() * 1000) % 100000
-            await ws.send(json.dumps({
-                "id": scrape_id,
-                "method": "Runtime.evaluate",
-                "params": {"expression": scrape_js, "returnByValue": True}
-            }))
-
-            data = None
-            try:
-                while True:
-                    raw = await asyncio.wait_for(ws.recv(), 4.0)
-                    m = json.loads(raw)
-                    if m.get("id") == scrape_id:
-                        val = m.get("result", {}).get("result", {}).get("value")
-                        if val:
-                            data = json.loads(val)
-                        break
-            except asyncio.TimeoutError:
-                continue
-
-            if not data:
-                continue
-
-            curr = data.get("text", "")
-            streaming = data.get("is_streaming", False)
-            turns_count = data.get("turns_count", 0)
-
-            if streaming:
-                has_streamed = True
-                print(f"  ... Streaming response ({len(curr)} chars) ...")
-
-            if (turns_count > baseline_count or has_streamed) and curr:
-                if curr == last_text and not streaming:
-                    stable_count += 1
-                    if stable_count >= 2:
-                        print(f"[✓] ChatGPT Response Completed ({len(curr)} chars) in {round(time.time() - start_time, 1)}s!")
-                        with open("chatgpt_hospital_response.md", "w", encoding="utf-8") as f:
-                            f.write(curr)
-                        print("  -> Saved response to chatgpt_hospital_response.md")
-                        
-                        # Now update Obsidian Vault session summary
-                        update_session_summary(curr)
-                        return curr
-                else:
-                    stable_count = 0
-                    last_text = curr
-
-        if last_text:
-            print(f"[!] Reached timeout, capturing partial response ({len(last_text)} chars)")
-            with open("chatgpt_hospital_response.md", "w", encoding="utf-8") as f:
-                f.write(last_text)
-            update_session_summary(last_text)
-            return last_text
-
-        print("[-] Timeout waiting for response")
-        return ""
+        baseline_count = await get_baseline_turns(ws)
+        await inject_prompt(ws, PROMPT)
+        return await monitor_response(ws, baseline_count)
 
 def update_session_summary(gpt_response: str):
     print("[5] Synchronizing updated session context summary to Obsidian Vault...")
