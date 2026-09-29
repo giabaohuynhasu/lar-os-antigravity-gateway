@@ -17,13 +17,11 @@ import os
 import sys
 import time
 import json
-import uuid
 import shutil
 import asyncio
 import urllib.request
 import urllib.parse
 from pathlib import Path
-from typing import Dict, Any, List
 
 if sys.platform.startswith("win"):
     sys.stdout.reconfigure(encoding="utf-8")
@@ -35,11 +33,9 @@ if not PYTHON_EXE.exists():
 
 from lar_os_nuclear_watcher import (
     NuclearWatcher,
-    IncidentFSM,
     get_windows_process_creation_time,
     verify_process_incarnation,
-    HEARTBEAT_FILE,
-    STATE_FILE
+    HEARTBEAT_FILE
 )
 
 GATEWAY_URL = "http://127.0.0.1:18797"
