@@ -60,29 +60,16 @@ def http_post(url: str, payload: Dict[str, Any], timeout: float = 30.0) -> Tuple
         elapsed_ms = (time.monotonic() - t0) * 1000.0
         return 0, {"error": str(e)}, elapsed_ms
 
-def run_chaos_tests():
-    print("=" * 65)
-    print("⚡ LAR-OS GATEWAY: PHASE 11 COMPREHENSIVE CHAOS TEST SUITE")
-    print("=" * 65)
-
-    passes = 0
-    total = 0
-
-    # -------------------------------------------------------------
-    # Test C1: Gateway Liveness & Baseline Status
-    # -------------------------------------------------------------
-    total += 1
+def test_c1_gateway_liveness() -> Tuple[bool, Dict[str, Any]]:
     status_code, status_data = http_get(f"{GATEWAY_URL}/status", timeout=3.0)
     if status_code == 200 and status_data.get("status") == "ONLINE":
         log_test("C1: Gateway Status & Liveness", "PASS", f"(Uptime: {status_data.get('uptime_seconds')}s)")
-        passes += 1
+        return True, status_data
     else:
         log_test("C1: Gateway Status & Liveness", "FAIL", f"(Status: {status_code})")
+        return False, status_data
 
-    # -------------------------------------------------------------
-    # Test C2: Phase 8 Deep Health Check (L1 TCP Socket + L2 OAuth)
-    # -------------------------------------------------------------
-    total += 1
+def test_c2_deep_health(status_data: Dict[str, Any]) -> bool:
     wd = status_data.get("watchdog", {})
     l1_tcp = wd.get("tcp_listening", False)
     deep_h = wd.get("deep_health", {})
@@ -91,14 +78,12 @@ def run_chaos_tests():
     if l1_tcp and deep_h and liveness_st in ("HEALTHY", "DEGRADED", "OAUTH_SUSPECT"):
         log_test("C2: Phase 8 Deep Health Verification", "PASS", 
                  f"(L1 TCP: {'OPEN' if l1_tcp else 'CLOSED'}, State: {liveness_st}, OAuth: {deep_h.get('status')})")
-        passes += 1
+        return True
     else:
         log_test("C2: Phase 8 Deep Health Verification", "FAIL", f"(wd: {wd})")
+        return False
 
-    # -------------------------------------------------------------
-    # Test C3: Real Request Execution (Critical Path Latency)
-    # -------------------------------------------------------------
-    total += 1
+def test_c3_real_request_routing() -> bool:
     req_payload = {
         "model": "gemini-2.5-flash",
         "messages": [{"role": "user", "content": "Respond with single word: READY"}]
@@ -112,28 +97,25 @@ def run_chaos_tests():
     
     if code == 200 and choice_text:
         log_test("C3: Real Request Routing & Latency", "PASS", f"(Latency: {lat_ms:.0f}ms, Output: '{choice_text[:20]}')")
-        passes += 1
+        return True
     else:
         log_test("C3: Real Request Routing & Latency", "FAIL", f"(Code: {code}, res: {res})")
+        return False
 
-    # -------------------------------------------------------------
-    # Test C4: Phase 9 Process Self-Isolation (Chaos Simulation)
-    # -------------------------------------------------------------
-    total += 1
+def test_c4_self_isolation() -> bool:
     # Send malformed/empty payload to verify Gateway traps error cleanly
     code_bad, res_bad, lat_bad = http_post(f"{GATEWAY_URL}/v1/chat/completions", {"invalid_key": True}, timeout=10.0)
     # Gateway should return 200 or 400 without crashing
     code_check, _ = http_get(f"{GATEWAY_URL}/health", timeout=2.0)
     if code_check == 200:
         log_test("C4: Phase 9 Self-Isolation (Error Trapping)", "PASS", "(Gateway survived bad input with zero event loop hang)")
-        passes += 1
+        return True
     else:
         log_test("C4: Phase 9 Self-Isolation (Error Trapping)", "FAIL", "(Gateway unresponsive after bad payload)")
+        return False
 
-    # -------------------------------------------------------------
-    # Test C5: Process Kill & Watchdog Self-Healing (Chaos 2)
-    # -------------------------------------------------------------
-    total += 1
+def test_c5_watchdog_self_healing(status_data: Dict[str, Any]) -> bool:
+    wd = status_data.get("watchdog", {})
     old_pid = wd.get("pid")
     print(f"\n[+] Executing Chaos Injection: Terminating cli-proxy-api.exe (PID: {old_pid})...")
     subprocess.run(["taskkill", "/F", "/IM", "cli-proxy-api.exe"], capture_output=True)
@@ -159,15 +141,13 @@ def run_chaos_tests():
     if survived_kill and respawned and new_pid != old_pid:
         log_test("C5: Watchdog Self-Healing Under Process Kill", "PASS", 
                  f"(Old PID: {old_pid} -> New PID: {new_pid}, Port 18798 restored)")
-        passes += 1
+        return True
     else:
         log_test("C5: Watchdog Self-Healing Under Process Kill", "FAIL", 
                  f"(survived: {survived_kill}, respawned: {respawned}, new_pid: {new_pid})")
+        return False
 
-    # -------------------------------------------------------------
-    # Test C6: 25-Second Monotonic Request Budget Invariant
-    # -------------------------------------------------------------
-    total += 1
+def test_c6_request_budget() -> bool:
     # Post a prompt and measure hard upper bound
     req_payload_budget = {
         "model": "antigravity-gemini-3-flash",
@@ -177,14 +157,12 @@ def run_chaos_tests():
     budget_respected = (lat_b / 1000.0) <= 25.0
     if budget_respected and code_b in (200, 429, 503):
         log_test("C6: 25s Request Budget Invariant", "PASS", f"(Elapsed: {lat_b:.0f}ms <= 25,000ms)")
-        passes += 1
+        return True
     else:
         log_test("C6: 25s Request Budget Invariant", "FAIL", f"(Code: {code_b}, Elapsed: {lat_b:.0f}ms, res: {res_b})")
+        return False
 
-    # -------------------------------------------------------------
-    # Test C7: System Footprint & SQLite DB Cap
-    # -------------------------------------------------------------
-    total += 1
+def test_c7_system_footprint() -> bool:
     _, final_status = http_get(f"{GATEWAY_URL}/status", timeout=2.0)
     db_size_kb = final_status.get("telemetry", {}).get("db_size_kb", 0.0)
     total_events = final_status.get("telemetry", {}).get("total_events", 0)
@@ -193,13 +171,29 @@ def run_chaos_tests():
     if db_compliant and total_events >= 0:
         log_test("C7: SQLite WAL Hard Cap Invariant", "PASS", 
                  f"(DB Size: {db_size_kb:.1f} KB / 2,048 KB, Recorded Events: {total_events})")
-        passes += 1
+        return True
     else:
         log_test("C7: SQLite WAL Hard Cap Invariant", "FAIL", f"(DB Size: {db_size_kb:.1f} KB exceeds 2MB!)")
+        return False
 
-    # -------------------------------------------------------------
-    # Summary
-    # -------------------------------------------------------------
+def run_chaos_tests():
+    print("=" * 65)
+    print("⚡ LAR-OS GATEWAY: PHASE 11 COMPREHENSIVE CHAOS TEST SUITE")
+    print("=" * 65)
+
+    passes = 0
+    total = 7
+
+    passed_c1, status_data = test_c1_gateway_liveness()
+    if passed_c1: passes += 1
+
+    if test_c2_deep_health(status_data): passes += 1
+    if test_c3_real_request_routing(): passes += 1
+    if test_c4_self_isolation(): passes += 1
+    if test_c5_watchdog_self_healing(status_data): passes += 1
+    if test_c6_request_budget(): passes += 1
+    if test_c7_system_footprint(): passes += 1
+
     print("=" * 65)
     print(f"CHAOS SUITE SUMMARY: {passes} / {total} Tests PASSED ({passes/total*100:.1f}%)")
     print("=" * 65)
