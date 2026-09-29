@@ -874,9 +874,15 @@ def set_cached_response(prompt_hash: str, response: Any):
 # 5. FASTAPI APP & REGISTRY
 # ==========================================
 app = FastAPI(title="LAR-OS Unified AI Gateway v3.3", version="3.3.0-wal-telemetry")
+
+ALLOWED_ORIGINS = os.environ.get(
+    "ALLOWED_ORIGINS",
+    "http://localhost,http://127.0.0.1,http://localhost:18797,http://127.0.0.1:18797"
+).split(",")
+
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=ALLOWED_ORIGINS,
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
