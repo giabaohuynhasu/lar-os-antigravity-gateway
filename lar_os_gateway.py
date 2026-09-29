@@ -35,6 +35,7 @@ from pathlib import Path
 
 import faulthandler
 import traceback
+import aiohttp
 
 if sys.platform.startswith("win"):
     sys.stdout.reconfigure(encoding="utf-8")
@@ -1224,7 +1225,7 @@ async def execute_model_request(model: str, messages: List[Dict[str, Any]], tool
     # Convert tools if provided
     gemini_tools = translate_anthropic_tools_to_gemini(tools) if tools else None
 
-    def _do_request_sync(k: str, m: str, p: str, g_tools: Optional[List[Dict[str, Any]]]):
+    async def _do_request_async(k: str, m: str, p: str, g_tools: Optional[List[Dict[str, Any]]]):
         u = f"https://generativelanguage.googleapis.com/v1beta/models/{m}:generateContent?key={k}"
         payload: Dict[str, Any] = {
             "contents": [{"parts": [{"text": p}]}],
@@ -1236,32 +1237,26 @@ async def execute_model_request(model: str, messages: List[Dict[str, Any]], tool
         if g_tools:
             payload["tools"] = g_tools
             
-        d = json.dumps(payload).encode("utf-8")
-        req = urllib.request.Request(u, data=d, headers={"Content-Type": "application/json"}, method="POST")
-        r = None
-        try:
-            r = urllib.request.urlopen(req, timeout=5)
-            if r.status == 200:
-                data = json.loads(r.read().decode("utf-8"))
-                cand = data.get("candidates", [{}])[0]
-                parts = cand.get("content", {}).get("parts", [])
-                
-                resp_text = ""
-                tool_calls = []
-                for part in parts:
-                    if "text" in part:
-                        resp_text += part["text"]
-                    elif "functionCall" in part:
-                        fc = part["functionCall"]
-                        tool_calls.append({
-                            "name": fc.get("name"),
-                            "args": fc.get("args", {})
-                        })
-                return {"text": resp_text, "tool_calls": tool_calls}
-        finally:
-            if r is not None:
-                with contextlib.suppress(Exception):
-                    r.close()
+        async with aiohttp.ClientSession() as session:
+            async with session.post(u, json=payload, headers={"Content-Type": "application/json"}, timeout=5) as r:
+                r.raise_for_status()
+                if r.status == 200:
+                    data = await r.json()
+                    cand = data.get("candidates", [{}])[0]
+                    parts = cand.get("content", {}).get("parts", [])
+
+                    resp_text = ""
+                    tool_calls = []
+                    for part in parts:
+                        if "text" in part:
+                            resp_text += part["text"]
+                        elif "functionCall" in part:
+                            fc = part["functionCall"]
+                            tool_calls.append({
+                                "name": fc.get("name"),
+                                "args": fc.get("args", {})
+                            })
+                    return {"text": resp_text, "tool_calls": tool_calls}
         return None
 
     # Monotonic deadline budget & Decorrelated Jitter state (Phase 7)
@@ -1284,7 +1279,7 @@ async def execute_model_request(model: str, messages: List[Dict[str, Any]], tool
             t_start = time.monotonic()
             call_timeout = min(4.5, remaining)
             res_dict, call_exc = await _isolated_provider_call(
-                asyncio.to_thread(_do_request_sync, key_entry["key"], target_model, compacted_query, gemini_tools),
+                _do_request_async(key_entry["key"], target_model, compacted_query, gemini_tools),
                 timeout_sec=call_timeout
             )
             elapsed_ms = (time.monotonic() - t_start) * 1000.0
