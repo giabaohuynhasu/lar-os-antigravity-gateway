@@ -146,9 +146,11 @@ async def query_model(prompt: str, model: str = "gemini-3.5-flash") -> str:
         headers={"Content-Type": "application/json", "Authorization": "Bearer agy-cli-local"}
     )
     try:
-        with urllib.request.urlopen(req, timeout=60) as resp:
-            data = json.loads(resp.read().decode("utf-8"))
-            return data["choices"][0]["message"]["content"]
+        def fetch():
+            with urllib.request.urlopen(req, timeout=60) as resp:
+                data = json.loads(resp.read().decode("utf-8"))
+                return data["choices"][0]["message"]["content"]
+        return await asyncio.to_thread(fetch)
     except Exception as e:
         return f"[Error: Không thể kết nối Gateway ({e}). Hãy kiểm tra lar_os_gateway.py]"
 
