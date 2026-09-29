@@ -180,17 +180,7 @@ class OperaNeonBridge:
         except Exception:
             return {"engine": engine, "raw": val}
 
-    async def consult_ai(self, engine: str, prompt: str, timeout_seconds: int = 45) -> Dict[str, Any]:
-        cfg = AI_TARGETS.get(engine, AI_TARGETS["chatgpt"])
-        domain = urllib.parse.urlparse(cfg["url"]).netloc
-        tab = self.get_or_create_tab(domain, cfg["url"])
-        if not tab:
-            return {"status": "error", "message": f"Could not find or open {engine} in Opera Neon"}
-            
-        ws_url = tab["webSocketDebuggerUrl"]
-        
-        # Check status before sending
-        status = await self.inspect_target_status(engine)
+    async def _check_status_interrupts(self, engine: str, status: Dict[str, Any]) -> Optional[Dict[str, Any]]:
         if status.get("has_cloudflare_turnstile"):
             return {
                 "status": "HUMAN_INTERVENTION_REQUIRED",
@@ -206,12 +196,9 @@ class OperaNeonBridge:
                 "reset_time": "14:00",
                 "action": "Message limit resets at 14:00 (local time) or upgrade to Pro."
             }
-            
-        # Navigate if not on target URL
-        if domain not in tab.get("url", ""):
-            await self.execute_cdp(ws_url, "Page.navigate", {"url": cfg["url"]})
-            await asyncio.sleep(4)
-            
+        return None
+
+    async def _inject_prompt(self, ws_url: str, engine: str, cfg: Dict[str, Any], prompt: str) -> int:
         # Inject prompt using hardened bottom-composer finder to prevent targeting past message edits ("Sửa") or Canvas writing panels
         escaped_prompt = json.dumps(prompt)
         inject_js = f"""
@@ -297,10 +284,11 @@ class OperaNeonBridge:
         }})()
         """
         baseline_count = (await self.evaluate_js(ws_url, baseline_js)) or 0
-
         inject_res = await self.evaluate_js(ws_url, inject_js)
         print(f"[+] Prompt injected into {engine} (baseline {baseline_count}): {inject_res}")
-        
+        return baseline_count
+
+    async def _poll_for_response(self, ws_url: str, engine: str, cfg: Dict[str, Any], prompt: str, baseline_count: int, timeout_seconds: int) -> Optional[Dict[str, Any]]:
         # Poll for response completion
         print(f"[+] Waiting for {engine} response (up to {timeout_seconds}s)...")
         start_time = time.time()
@@ -360,6 +348,31 @@ class OperaNeonBridge:
                 "elapsed_seconds": timeout_seconds,
                 "warning": "Polling reached timeout limit; returning latest captured output."
             }
+        return None
+
+    async def consult_ai(self, engine: str, prompt: str, timeout_seconds: int = 45) -> Dict[str, Any]:
+        cfg = AI_TARGETS.get(engine, AI_TARGETS["chatgpt"])
+        domain = urllib.parse.urlparse(cfg["url"]).netloc
+        tab = self.get_or_create_tab(domain, cfg["url"])
+        if not tab:
+            return {"status": "error", "message": f"Could not find or open {engine} in Opera Neon"}
+
+        ws_url = tab["webSocketDebuggerUrl"]
+
+        status = await self.inspect_target_status(engine)
+        interrupt_response = await self._check_status_interrupts(engine, status)
+        if interrupt_response:
+            return interrupt_response
+
+        if domain not in tab.get("url", ""):
+            await self.execute_cdp(ws_url, "Page.navigate", {"url": cfg["url"]})
+            await asyncio.sleep(4)
+
+        baseline_count = await self._inject_prompt(ws_url, engine, cfg, prompt)
+
+        poll_response = await self._poll_for_response(ws_url, engine, cfg, prompt, baseline_count, timeout_seconds)
+        if poll_response:
+            return poll_response
             
         return {
             "status": "pending_or_modal",
