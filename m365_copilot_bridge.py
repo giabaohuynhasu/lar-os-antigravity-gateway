@@ -54,6 +54,108 @@ def get_copilot_tab(port: int = CDP_PORT) -> Optional[Dict[str, Any]]:
         return None
 
 
+async def _dismiss_cookie_consent(ws: websockets.WebSocketClientProtocol) -> None:
+    dismiss_script = """
+    (() => {
+        const btns = Array.from(document.querySelectorAll('button'));
+        const acceptBtn = btns.find(b => b.innerText.includes('Chấp nhận') || b.innerText.includes('Accept'));
+        if (acceptBtn) { acceptBtn.click(); return true; }
+        return false;
+    })()
+    """
+    await ws.send(json.dumps({"id": 1, "method": "Runtime.evaluate", "params": {"expression": dismiss_script}}))
+    await ws.recv()
+
+
+async def _focus_textarea(ws: websockets.WebSocketClientProtocol) -> None:
+    focus_script = """
+    (() => {
+        const ta = document.querySelector('textarea');
+        if (ta) { ta.focus(); return true; }
+        return false;
+    })()
+    """
+    await ws.send(json.dumps({"id": 2, "method": "Runtime.evaluate", "params": {"expression": focus_script}}))
+    await ws.recv()
+
+
+async def _insert_text(ws: websockets.WebSocketClientProtocol, prompt: str) -> None:
+    await ws.send(json.dumps({
+        "id": 3,
+        "method": "Input.insertText",
+        "params": {"text": prompt}
+    }))
+    await ws.recv()
+    await asyncio.sleep(0.3)
+
+
+async def _dispatch_enter(ws: websockets.WebSocketClientProtocol) -> None:
+    await ws.send(json.dumps({
+        "id": 4,
+        "method": "Input.dispatchKeyEvent",
+        "params": {
+            "type": "keyDown",
+            "key": "Enter",
+            "code": "Enter",
+            "windowsVirtualKeyCode": 13,
+            "nativeVirtualKeyCode": 13
+        }
+    }))
+    await ws.recv()
+    await ws.send(json.dumps({
+        "id": 5,
+        "method": "Input.dispatchKeyEvent",
+        "params": {
+            "type": "keyUp",
+            "key": "Enter",
+            "code": "Enter",
+            "windowsVirtualKeyCode": 13,
+            "nativeVirtualKeyCode": 13
+        }
+    }))
+    await ws.recv()
+
+
+async def _poll_response(ws: websockets.WebSocketClientProtocol, timeout_seconds: int) -> str:
+    extracted_answer = ""
+    prev_len = 0
+    stable_count = 0
+
+    for poll_idx in range(timeout_seconds // 2):
+        await asyncio.sleep(2)
+        check_script = """
+        (() => {
+            const body = document.body ? document.body.innerText : '';
+            const stopBtn = document.querySelector('button[aria-label*="Dừng"], button[aria-label*="Stop"]');
+            return JSON.stringify({
+                len: body.length,
+                isGenerating: !!stopBtn,
+                text: body
+            });
+        })()
+        """
+        await ws.send(json.dumps({"id": 100 + poll_idx, "method": "Runtime.evaluate", "params": {"expression": check_script}}))
+        raw = await ws.recv()
+        info = json.loads(json.loads(raw).get("result", {}).get("result", {}).get("value", "{}"))
+
+        cur_len = info.get("len", 0)
+        is_generating = info.get("isGenerating", False)
+
+        if cur_len == prev_len and cur_len > 300:
+            stable_count += 1
+        else:
+            stable_count = 0
+        prev_len = cur_len
+
+        if (not is_generating and stable_count >= 2) or (poll_idx > 5 and not is_generating):
+            full_body = info.get("text", "")
+            # Extract conversational turn
+            extracted_answer = full_body
+            break
+
+    return extracted_answer
+
+
 async def query_m365_copilot(prompt: str, timeout_seconds: int = 60) -> Dict[str, Any]:
     """
     Submits a query to Microsoft Copilot via CDP port 9223,
@@ -76,100 +178,11 @@ async def query_m365_copilot(prompt: str, timeout_seconds: int = 60) -> Dict[str
     start_time = time.time()
 
     async with websockets.connect(ws_url) as ws:
-        # 1. Dismiss any overlay cookie consent if present
-        dismiss_script = """
-        (() => {
-            const btns = Array.from(document.querySelectorAll('button'));
-            const acceptBtn = btns.find(b => b.innerText.includes('Chấp nhận') || b.innerText.includes('Accept'));
-            if (acceptBtn) { acceptBtn.click(); return true; }
-            return false;
-        })()
-        """
-        await ws.send(json.dumps({"id": 1, "method": "Runtime.evaluate", "params": {"expression": dismiss_script}}))
-        await ws.recv()
-
-        # 2. Focus textarea
-        focus_script = """
-        (() => {
-            const ta = document.querySelector('textarea');
-            if (ta) { ta.focus(); return true; }
-            return false;
-        })()
-        """
-        await ws.send(json.dumps({"id": 2, "method": "Runtime.evaluate", "params": {"expression": focus_script}}))
-        await ws.recv()
-
-        # 3. Native CDP Keystroke input
-        await ws.send(json.dumps({
-            "id": 3,
-            "method": "Input.insertText",
-            "params": {"text": prompt}
-        }))
-        await ws.recv()
-        await asyncio.sleep(0.3)
-
-        # 4. Dispatch Hardware Enter key
-        await ws.send(json.dumps({
-            "id": 4,
-            "method": "Input.dispatchKeyEvent",
-            "params": {
-                "type": "keyDown",
-                "key": "Enter",
-                "code": "Enter",
-                "windowsVirtualKeyCode": 13,
-                "nativeVirtualKeyCode": 13
-            }
-        }))
-        await ws.recv()
-        await ws.send(json.dumps({
-            "id": 5,
-            "method": "Input.dispatchKeyEvent",
-            "params": {
-                "type": "keyUp",
-                "key": "Enter",
-                "code": "Enter",
-                "windowsVirtualKeyCode": 13,
-                "nativeVirtualKeyCode": 13
-            }
-        }))
-        await ws.recv()
-
-        # 5. Poll response with backoff until completed
-        extracted_answer = ""
-        prev_len = 0
-        stable_count = 0
-
-        for poll_idx in range(timeout_seconds // 2):
-            await asyncio.sleep(2)
-            check_script = """
-            (() => {
-                const body = document.body ? document.body.innerText : '';
-                const stopBtn = document.querySelector('button[aria-label*="Dừng"], button[aria-label*="Stop"]');
-                return JSON.stringify({
-                    len: body.length,
-                    isGenerating: !!stopBtn,
-                    text: body
-                });
-            })()
-            """
-            await ws.send(json.dumps({"id": 100 + poll_idx, "method": "Runtime.evaluate", "params": {"expression": check_script}}))
-            raw = await ws.recv()
-            info = json.loads(json.loads(raw).get("result", {}).get("result", {}).get("value", "{}"))
-            
-            cur_len = info.get("len", 0)
-            is_generating = info.get("isGenerating", False)
-
-            if cur_len == prev_len and cur_len > 300:
-                stable_count += 1
-            else:
-                stable_count = 0
-            prev_len = cur_len
-
-            if (not is_generating and stable_count >= 2) or (poll_idx > 5 and not is_generating):
-                full_body = info.get("text", "")
-                # Extract conversational turn
-                extracted_answer = full_body
-                break
+        await _dismiss_cookie_consent(ws)
+        await _focus_textarea(ws)
+        await _insert_text(ws, prompt)
+        await _dispatch_enter(ws)
+        extracted_answer = await _poll_response(ws, timeout_seconds)
 
         duration = round(time.time() - start_time, 2)
         return {
