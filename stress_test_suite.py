@@ -17,13 +17,11 @@ import os
 import sys
 import time
 import json
-import uuid
 import shutil
 import asyncio
 import urllib.request
 import urllib.parse
 from pathlib import Path
-from typing import Dict, Any, List
 
 if sys.platform.startswith("win"):
     sys.stdout.reconfigure(encoding="utf-8")
