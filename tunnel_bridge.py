@@ -26,8 +26,8 @@ SCRATCH_DIR = Path(__file__).resolve().parent
 CLOUDFLARED_BIN = Path(r"C:\Users\nswcl\bin\cloudflared.exe")
 DRIVE_DIR = Path(r"G:\Drive của tôi\Gemini_Spark_Bridge")
 
-def generate_chatgpt_openapi(public_url: str):
-    schema = {
+def get_chatgpt_openapi_schema(public_url: str) -> dict:
+    return {
         "openapi": "3.1.0",
         "info": {
             "title": "Antigravity Autonomous Operating System API",
@@ -130,6 +130,9 @@ def generate_chatgpt_openapi(public_url: str):
             }
         }
     }
+
+def generate_chatgpt_openapi(public_url: str):
+    schema = get_chatgpt_openapi_schema(public_url)
     
     out_path = SCRATCH_DIR / "chatgpt_actions_openapi.json"
     with open(out_path, "w", encoding="utf-8") as f:
