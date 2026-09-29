@@ -34,8 +34,7 @@ def run_remote_command(cmd: str, node_name="thuaquan228"):
     ssh_args = [
         "ssh",
         "-i", str(SSH_KEY),
-        "-o", "StrictHostKeyChecking=no",
-        "-o", "UserKnownHostsFile=/dev/null",
+        "-o", "StrictHostKeyChecking=yes",
         "-o", "LogLevel=ERROR",
         "-p", str(node["port"]),
         f"{node['user']}@{node['host']}",
@@ -52,8 +51,7 @@ def run_remote_python(code: str, node_name="thuaquan228"):
     ssh_args = [
         "ssh",
         "-i", str(SSH_KEY),
-        "-o", "StrictHostKeyChecking=no",
-        "-o", "UserKnownHostsFile=/dev/null",
+        "-o", "StrictHostKeyChecking=yes",
         "-o", "LogLevel=ERROR",
         "-p", str(node["port"]),
         f"{node['user']}@{node['host']}",
