@@ -10,6 +10,7 @@ Features:
 - Strips routing noise so models receive pure, clean instructions.
 """
 
+import os
 import re
 import sys
 import unicodedata
@@ -34,19 +35,7 @@ class VibeResult:
     send_email: bool = False
     vibe_notes: List[str] = field(default_factory=list)
 
-def interpret_vibe(args: List[str]) -> VibeResult:
-    """
-    Parses a list of argument tokens into a VibeResult.
-    Handles traditional flags if present (-m, -e, -s, -i) OR 100% pure vibe slang.
-    """
-    if not args:
-        return VibeResult(
-            action="interactive",
-            prompt="",
-            vibe_notes=["Không có tham số -> Chuyển sang chế độ hội thoại trực tiếp (Interactive Chat)"]
-        )
-
-    # Check for traditional flags first (backward compatibility)
+def _parse_flags(args: List[str]) -> tuple[Optional[str], bool, bool, bool, List[str]]:
     manual_model: Optional[str] = None
     manual_email: bool = False
     manual_status: bool = False
@@ -70,40 +59,25 @@ def interpret_vibe(args: List[str]) -> VibeResult:
         else:
             remaining_tokens.append(tok)
         i += 1
+    return manual_model, manual_email, manual_status, manual_inbox, remaining_tokens
 
-    if manual_status:
-        return VibeResult(action="status", prompt="", vibe_notes=["Cờ --status được kích hoạt"])
-    if manual_inbox:
-        return VibeResult(action="inbox", prompt="", vibe_notes=["Cờ --inbox được kích hoạt"])
 
-    raw_text = " ".join(remaining_tokens).strip()
-    if not raw_text:
-        return VibeResult(
-            action="interactive",
-            prompt="",
-            model=manual_model or "gemini-3.5-flash",
-            send_email=manual_email,
-            vibe_notes=["Không có prompt -> Chế độ tương tác"]
-        )
-
-    norm_text = strip_accents(raw_text)
-    notes: List[str] = []
-
-    # 1. Check for Status Vibe
+def _check_status_vibe(norm_text: str, raw_text: str) -> Optional[VibeResult]:
     status_keywords = [
         "st", "status", "check he thong", "khoe ko", "khoe khong", "on ko", "on khong",
         "song ko", "song khong", "sao roi", "tinh hinh", "ping", "trang thai",
         "check he thong xem on ko", "he thong sao roi", "xem trang thai", "may moc on ko"
     ]
-    # Exact match or very short query
     if norm_text in status_keywords or (len(norm_text.split()) <= 4 and any(norm_text == kw or norm_text.startswith(kw) for kw in ["st", "status", "ping", "khoe ko", "sao roi", "tinh hinh"])):
         return VibeResult(
             action="status",
             prompt=raw_text,
             vibe_notes=["Nhận diện vibe: Kiểm tra trạng thái hệ thống (Status Check)"]
         )
+    return None
 
-    # 2. Check for Inbox Vibe
+
+def _check_inbox_vibe(norm_text: str, raw_text: str) -> Optional[VibeResult]:
     inbox_keywords = [
         "ib", "inbox", "hop thu", "hop thu drive", "drive inbox", "co gi moi",
         "lenh moi", "pending", "check inbox", "check hop thu", "kiem tra hop thu"
@@ -114,8 +88,10 @@ def interpret_vibe(args: List[str]) -> VibeResult:
             prompt=raw_text,
             vibe_notes=["Nhận diện vibe: Quét lệnh mới trong hộp thư Drive Inbox"]
         )
+    return None
 
-    # 3. Check for Interactive Chat Vibe
+
+def _check_interactive_vibe(norm_text: str, manual_model: Optional[str], manual_email: bool) -> Optional[VibeResult]:
     chat_keywords = ["chat", "talk", "tro chuyen", "hoi dap", "tam su", "interactive"]
     if norm_text in chat_keywords:
         return VibeResult(
@@ -125,20 +101,19 @@ def interpret_vibe(args: List[str]) -> VibeResult:
             send_email=manual_email,
             vibe_notes=["Nhận diện vibe: Bắt đầu phiên chat trực tiếp"]
         )
+    return None
 
-    # 4. Extract Model Routing from Vibe
+
+def _extract_model_routing(norm_text: str, raw_text: str, remaining_tokens: List[str], manual_model: Optional[str], notes: List[str]) -> tuple[str, str]:
     selected_model = manual_model or "gemini-3.5-flash"
     working_text = raw_text
 
-    # Model routing heuristics (prefix-based or token-based)
     first_token_norm = strip_accents(remaining_tokens[0]).lower() if remaining_tokens else ""
     first_two_norm = " ".join([strip_accents(t) for t in remaining_tokens[:2]]).lower() if len(remaining_tokens) >= 2 else ""
 
-    # Priority 1: Prefix match (e.g. `a claude <prompt>`, `vibe gpt <prompt>`)
     if first_token_norm in ("claude", "sonnet", "anthropic") or first_two_norm.startswith("claude"):
         selected_model = "claude"
         notes.append("Định tuyến sang Claude Sonnet 5 Max (qua Opera Neon CDP)")
-        # Strip prefix
         working_text = re.sub(r"^(claude|sonnet|anthropic)\s*[:,-]?\s*", "", working_text, flags=re.IGNORECASE).strip()
     elif first_token_norm in ("chatgpt", "gpt", "gpt5", "gpt4", "openai") or first_two_norm in ("chat gpt", "gpt 5"):
         selected_model = "chatgpt"
@@ -153,7 +128,6 @@ def interpret_vibe(args: List[str]) -> VibeResult:
         notes.append("Định tuyến sang Gemini 3.5 Flash (5-Pro Key Quota Pool)")
         working_text = re.sub(r"^(flash|gemini flash|gemini-flash|3\.5 flash)\s*[:,-]?\s*", "", working_text, flags=re.IGNORECASE).strip()
     else:
-        # Check if model is mentioned anywhere with explicit directive (e.g., "hoi claude xem...", "dung gpt viet...")
         if re.search(r"\b(hoi claude|dung claude|qua claude|claude oi)\b", norm_text):
             selected_model = "claude"
             notes.append("Nhận diện từ khóa 'claude' -> Định tuyến sang Claude Sonnet 5")
@@ -165,11 +139,12 @@ def interpret_vibe(args: List[str]) -> VibeResult:
             notes.append("Nhận diện từ khóa 'pro' -> Định tuyến sang Gemini 3.5 Pro")
         else:
             notes.append("Mô hình mặc định: Gemini 3.5 Flash (Tốc độ cao qua 5-Pro Quota Pool)")
+    return selected_model, working_text
 
-    # 5. Extract Email Dispatch Intent
+
+def _extract_email_intent(working_text: str, manual_email: bool, notes: List[str]) -> tuple[bool, str]:
     send_email = manual_email or os.environ.get("AGY_AUTO_EMAIL", "").lower() in ("1", "true", "yes")
 
-    # Prefix match: "mail ...", "gui mail ...", "email ..."
     prefix_email_match = re.match(r"^(gui\s+)?(mail|gmail|email)\s*[:,-]?\s+", working_text, flags=re.IGNORECASE)
     if prefix_email_match:
         send_email = True
@@ -196,7 +171,6 @@ def interpret_vibe(args: List[str]) -> VibeResult:
 
     if send_email:
         notes.append("✉️ Tự động gửi báo cáo qua Gmail (thuaquan228@gmail.com)")
-        # Clean email phrase from end of prompt to avoid confusing the LLM
         clean_prompt = re.sub(
             r"\s*(roi|kem|dong thoi|va)?\s*(nho\s+)?(gui|send|chuyen)?\s*(qua|vao|ve|cho)?\s*(mail|gmail|email|thu)(\s+(cho\s+)?(tui|toi|tao|em|anh|minh|me|to))?(\s+(nhe|nha|giup|ho|ngay))?[\.!]?$",
             "",
@@ -206,6 +180,62 @@ def interpret_vibe(args: List[str]) -> VibeResult:
         if clean_prompt:
             working_text = clean_prompt
 
+    return send_email, working_text
+
+
+def interpret_vibe(args: List[str]) -> VibeResult:
+    """
+    Parses a list of argument tokens into a VibeResult.
+    Handles traditional flags if present (-m, -e, -s, -i) OR 100% pure vibe slang.
+    """
+    if not args:
+        return VibeResult(
+            action="interactive",
+            prompt="",
+            vibe_notes=["Không có tham số -> Chuyển sang chế độ hội thoại trực tiếp (Interactive Chat)"]
+        )
+
+    # Check for traditional flags first (backward compatibility)
+    manual_model, manual_email, manual_status, manual_inbox, remaining_tokens = _parse_flags(args)
+
+    if manual_status:
+        return VibeResult(action="status", prompt="", vibe_notes=["Cờ --status được kích hoạt"])
+    if manual_inbox:
+        return VibeResult(action="inbox", prompt="", vibe_notes=["Cờ --inbox được kích hoạt"])
+
+    raw_text = " ".join(remaining_tokens).strip()
+    if not raw_text:
+        return VibeResult(
+            action="interactive",
+            prompt="",
+            model=manual_model or "gemini-3.5-flash",
+            send_email=manual_email,
+            vibe_notes=["Không có prompt -> Chế độ tương tác"]
+        )
+
+    norm_text = strip_accents(raw_text)
+    notes: List[str] = []
+
+    # 1. Check for Status Vibe
+    status_result = _check_status_vibe(norm_text, raw_text)
+    if status_result:
+        return status_result
+
+    # 2. Check for Inbox Vibe
+    inbox_result = _check_inbox_vibe(norm_text, raw_text)
+    if inbox_result:
+        return inbox_result
+
+    # 3. Check for Interactive Chat Vibe
+    interactive_result = _check_interactive_vibe(norm_text, manual_model, manual_email)
+    if interactive_result:
+        return interactive_result
+
+    # 4. Extract Model Routing from Vibe
+    selected_model, working_text = _extract_model_routing(norm_text, raw_text, remaining_tokens, manual_model, notes)
+
+    # 5. Extract Email Dispatch Intent
+    send_email, working_text = _extract_email_intent(working_text, manual_email, notes)
 
     return VibeResult(
         action="query",
