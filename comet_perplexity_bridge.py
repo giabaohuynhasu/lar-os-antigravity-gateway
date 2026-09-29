@@ -11,7 +11,7 @@ import os
 import sys
 import time
 import urllib.request
-from typing import Dict, Any, Optional
+from typing import Dict, Any, Optional, Tuple
 
 if sys.platform.startswith("win"):
     sys.stdout.reconfigure(encoding="utf-8")
@@ -53,6 +53,85 @@ def get_perplexity_tab(port: int = COMET_CDP_PORT) -> Optional[Dict[str, Any]]:
         return None
 
 
+async def _focus_input(ws: websockets.WebSocketClientProtocol) -> None:
+    focus_script = """
+    (() => {
+        const el = document.querySelector('div[contenteditable="true"], textarea');
+        if (el) { el.focus(); return true; }
+        return false;
+    })()
+    """
+    await ws.send(json.dumps({"id": 1, "method": "Runtime.evaluate", "params": {"expression": focus_script}}))
+    await ws.recv()
+
+async def _insert_text(ws: websockets.WebSocketClientProtocol, prompt: str) -> None:
+    await ws.send(json.dumps({
+        "id": 2,
+        "method": "Input.insertText",
+        "params": {"text": prompt}
+    }))
+    await ws.recv()
+    await asyncio.sleep(0.4)
+
+async def _dispatch_enter_key(ws: websockets.WebSocketClientProtocol) -> None:
+    await ws.send(json.dumps({
+        "id": 3,
+        "method": "Input.dispatchKeyEvent",
+        "params": {
+            "type": "keyDown",
+            "key": "Enter",
+            "code": "Enter",
+            "windowsVirtualKeyCode": 13,
+            "nativeVirtualKeyCode": 13
+        }
+    }))
+    await ws.recv()
+    await ws.send(json.dumps({
+        "id": 4,
+        "method": "Input.dispatchKeyEvent",
+        "params": {
+            "type": "keyUp",
+            "key": "Enter",
+            "code": "Enter",
+            "windowsVirtualKeyCode": 13,
+            "nativeVirtualKeyCode": 13
+        }
+    }))
+    await ws.recv()
+
+async def _poll_for_completion(ws: websockets.WebSocketClientProtocol, timeout_seconds: int) -> Tuple[str, str]:
+    extracted_text = ""
+    final_url = ""
+
+    for poll_idx in range(timeout_seconds // 2):
+        await asyncio.sleep(2)
+        poll_script = """
+        (() => {
+            const body = document.body ? document.body.innerText : '';
+            const stopBtn = document.querySelector('button[aria-label*="Stop"], button[aria-label*="Dừng"]');
+            return JSON.stringify({
+                url: window.location.href,
+                bodyLength: body.length,
+                isStreaming: !!stopBtn,
+                text: body
+            });
+        })()
+        """
+        await ws.send(json.dumps({"id": 100 + poll_idx, "method": "Runtime.evaluate", "params": {"expression": poll_script}}))
+        raw = await ws.recv()
+        data = json.loads(json.loads(raw).get("result", {}).get("result", {}).get("value", "{}"))
+
+        cur_url = data.get("url", "")
+        is_streaming = data.get("isStreaming", False)
+
+        if "search" in cur_url and not is_streaming and poll_idx >= 3:
+            extracted_text = data.get("text", "")
+            final_url = cur_url
+            break
+
+    return extracted_text, final_url
+
+
 async def query_perplexity_comet(prompt: str, timeout_seconds: int = 60) -> Dict[str, Any]:
     """
     Submits a research query to Perplexity inside the Comet browser via CDP port 9225,
@@ -75,81 +154,10 @@ async def query_perplexity_comet(prompt: str, timeout_seconds: int = 60) -> Dict
     start_time = time.time()
 
     async with websockets.connect(ws_url) as ws:
-        # 1. Focus input
-        focus_script = """
-        (() => {
-            const el = document.querySelector('div[contenteditable="true"], textarea');
-            if (el) { el.focus(); return true; }
-            return false;
-        })()
-        """
-        await ws.send(json.dumps({"id": 1, "method": "Runtime.evaluate", "params": {"expression": focus_script}}))
-        await ws.recv()
-
-        # 2. Native CDP Text Insertion
-        await ws.send(json.dumps({
-            "id": 2,
-            "method": "Input.insertText",
-            "params": {"text": prompt}
-        }))
-        await ws.recv()
-        await asyncio.sleep(0.4)
-
-        # 3. Dispatch Hardware Enter key
-        await ws.send(json.dumps({
-            "id": 3,
-            "method": "Input.dispatchKeyEvent",
-            "params": {
-                "type": "keyDown",
-                "key": "Enter",
-                "code": "Enter",
-                "windowsVirtualKeyCode": 13,
-                "nativeVirtualKeyCode": 13
-            }
-        }))
-        await ws.recv()
-        await ws.send(json.dumps({
-            "id": 4,
-            "method": "Input.dispatchKeyEvent",
-            "params": {
-                "type": "keyUp",
-                "key": "Enter",
-                "code": "Enter",
-                "windowsVirtualKeyCode": 13,
-                "nativeVirtualKeyCode": 13
-            }
-        }))
-        await ws.recv()
-
-        # 4. Poll for streaming completion
-        extracted_text = ""
-        final_url = ""
-
-        for poll_idx in range(timeout_seconds // 2):
-            await asyncio.sleep(2)
-            poll_script = """
-            (() => {
-                const body = document.body ? document.body.innerText : '';
-                const stopBtn = document.querySelector('button[aria-label*="Stop"], button[aria-label*="Dừng"]');
-                return JSON.stringify({
-                    url: window.location.href,
-                    bodyLength: body.length,
-                    isStreaming: !!stopBtn,
-                    text: body
-                });
-            })()
-            """
-            await ws.send(json.dumps({"id": 100 + poll_idx, "method": "Runtime.evaluate", "params": {"expression": poll_script}}))
-            raw = await ws.recv()
-            data = json.loads(json.loads(raw).get("result", {}).get("result", {}).get("value", "{}"))
-
-            cur_url = data.get("url", "")
-            is_streaming = data.get("isStreaming", False)
-
-            if "search" in cur_url and not is_streaming and poll_idx >= 3:
-                extracted_text = data.get("text", "")
-                final_url = cur_url
-                break
+        await _focus_input(ws)
+        await _insert_text(ws, prompt)
+        await _dispatch_enter_key(ws)
+        extracted_text, final_url = await _poll_for_completion(ws, timeout_seconds)
 
         duration = round(time.time() - start_time, 2)
         return {
