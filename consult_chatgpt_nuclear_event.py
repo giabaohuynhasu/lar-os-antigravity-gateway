@@ -1,7 +1,5 @@
 import asyncio
 import sys
-import json
-import time
 from opera_neon_ai_bridge import get_bridge
 
 if sys.platform.startswith("win"):
