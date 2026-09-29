@@ -23,7 +23,6 @@ import asyncio
 import urllib.request
 import urllib.parse
 from pathlib import Path
-from typing import Dict, Any, List
 
 if sys.platform.startswith("win"):
     sys.stdout.reconfigure(encoding="utf-8")
