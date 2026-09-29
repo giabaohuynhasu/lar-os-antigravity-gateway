@@ -4,7 +4,7 @@ import os
 import shutil
 import sys
 import time
-import urllib.request
+import aiohttp
 import websockets
 
 if sys.platform.startswith("win"):
@@ -16,8 +16,9 @@ LOCAL_CONTEXT_FILE = "SESSION_CONTEXT_SUMMARY.md"
 
 async def harvest():
     print("[1] Connecting to Opera Neon tab to harvest streaming response...")
-    with urllib.request.urlopen("http://127.0.0.1:9224/json") as r:
-        tabs = json.loads(r.read().decode("utf-8"))
+    async with aiohttp.ClientSession() as session:
+        async with session.get("http://127.0.0.1:9224/json") as r:
+            tabs = await r.json()
     t = [x for x in tabs if x.get("id") == TARGET_ID][0]
     ws_url = t.get("webSocketDebuggerUrl")
 
